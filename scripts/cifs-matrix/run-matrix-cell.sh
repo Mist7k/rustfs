@@ -40,10 +40,10 @@
 # object reads back with its sha256, an unacknowledged object is either absent
 # or complete (overwrite: old or new content, never absent).
 #
-# CRASH_FAULT=power (cifs flavours only) puts the Samba export on ext4 on a
+# CRASH_FAULT=power puts the Samba export (fs=local: the data dir) on ext4 on a
 # device-mapper device and, before the kill, swaps its table to "error": every
-# write the server has not yet made durable is lost, like a power cut on the
-# server. Samba is restarted on the replayed filesystem afterwards.
+# write that is not yet durable is lost, like a power cut on the server. Samba
+# is restarted on the replayed filesystem afterwards.
 
 set -euo pipefail
 
@@ -152,11 +152,11 @@ cleanup() {
       sudo umount "$MNT" 2>/dev/null || sudo umount -l "$MNT" 2>/dev/null
     fi
     docker rm -f "$CONTAINER" >/dev/null 2>&1
-    if [[ -n "${DM_LOOP:-}" ]]; then
-      sudo umount "$EXPORT" 2>/dev/null
-      sudo dmsetup remove "$DM_NAME" 2>/dev/null
-      sudo losetup -d "$DM_LOOP" 2>/dev/null
-    fi
+  fi
+  if [[ -n "${DM_LOOP:-}" ]]; then
+    sudo umount "$DM_MOUNT" 2>/dev/null
+    sudo dmsetup remove "$DM_NAME" 2>/dev/null
+    sudo losetup -d "$DM_LOOP" 2>/dev/null
   fi
   return 0
 }
@@ -167,16 +167,17 @@ trap 'exit 143' TERM INT
 DM_NAME="cifs-crash-export"
 DM_LOOP=""
 DM_SECTORS=0
+DM_MOUNT=""
 
-# Puts $EXPORT on ext4 on a device-mapper device backed by a sparse file.
+# Puts $DM_MOUNT on ext4 on a device-mapper device backed by a sparse file.
 setup_dm() {
   truncate -s 6G "$WORK/backing.img"
   DM_LOOP="$(sudo losetup --find --show "$WORK/backing.img")"
   DM_SECTORS="$(sudo blockdev --getsz "$DM_LOOP")"
   sudo dmsetup create "$DM_NAME" --table "0 $DM_SECTORS linear $DM_LOOP 0"
   sudo mkfs.ext4 -q "/dev/mapper/$DM_NAME"
-  sudo mount "/dev/mapper/$DM_NAME" "$EXPORT"
-  sudo chown "$(id -u):$(id -g)" "$EXPORT"
+  sudo mount "/dev/mapper/$DM_NAME" "$DM_MOUNT"
+  sudo chown "$(id -u):$(id -g)" "$DM_MOUNT"
 }
 
 dm_table() {
@@ -185,18 +186,20 @@ dm_table() {
   sudo dmsetup resume "$DM_NAME"
 }
 
-# From here every read and write on the export fails.
+# From here every read and write on $DM_MOUNT fails.
 power_cut() { dm_table "0 $DM_SECTORS error"; }
 
-# Drops everything the server had not made durable and brings the export back.
+# Drops everything that was not yet durable and brings $DM_MOUNT back.
 power_restore() {
-  sudo umount -f "$MNT" 2>/dev/null || sudo umount -l "$MNT" || return 1
-  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-  sudo umount "$EXPORT" || return 1
+  if [[ "$IS_CIFS" == 1 ]]; then
+    sudo umount -f "$MNT" 2>/dev/null || sudo umount -l "$MNT" || return 1
+    docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  fi
+  sudo umount "$DM_MOUNT" || return 1
   dm_table "0 $DM_SECTORS linear $DM_LOOP 0" || return 1
   sudo e2fsck -p "/dev/mapper/$DM_NAME" >/dev/null 2>&1 || true
-  sudo mount "/dev/mapper/$DM_NAME" "$EXPORT" || return 1
-  samba_up || return 1
+  sudo mount "/dev/mapper/$DM_NAME" "$DM_MOUNT" || return 1
+  if [[ "$IS_CIFS" == 1 ]]; then samba_up || return 1; fi
   mkdir -p "$DATA"
 }
 
@@ -325,9 +328,14 @@ prepare_fs() {
   mkdir -p "$EXPORT" "$MNT" "$TMP"
 
   if [[ "$IS_CIFS" == 1 ]]; then
-    if [[ "${CRASH_FAULT:-kill}" == power ]]; then setup_dm; fi
+    if [[ "${CRASH_FAULT:-kill}" == power ]]; then DM_MOUNT="$EXPORT"; setup_dm; fi
     setup_cifs
     DATA="$MNT/data"
+  elif [[ "${CRASH_FAULT:-kill}" == power ]]; then
+    DM_MOUNT="$WORK/local-data"
+    mkdir -p "$DM_MOUNT"
+    setup_dm
+    DATA="$DM_MOUNT/data"
   else
     DATA="$WORK/local-data"
   fi
@@ -844,12 +852,12 @@ step_crash() {
   if [[ "${STATUS[2]}" != PASS ]]; then rec 3 "$name" SKIP "no bucket"; return 0; fi
   calibrate_cli
   if [[ "$CRASH_FAULT" == power ]]; then
-    if [[ "$IS_CIFS" != 1 || "$CRASH_OP" == start ]]; then
-      echo "CRASH_FAULT=power needs a cifs flavour and an object operation" >&2
+    if [[ -z "$DM_MOUNT" || "$CRASH_OP" == start ]]; then
+      echo "CRASH_FAULT=power needs fs=local or a cifs flavour and an object operation" >&2
       exit 2
     fi
     # The format written at first start must not be part of what gets lost.
-    sudo sync -f "$EXPORT"
+    sudo sync -f "$DM_MOUNT"
   fi
   case "$CRASH_OP" in
     put)       crash_put ;;

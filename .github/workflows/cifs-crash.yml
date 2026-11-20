@@ -51,9 +51,8 @@ jobs:
           - { identity: inode, fs: cifs-serverino }
           - { identity: inode, fs: local }
         exclude:
-          # A power cut needs the Samba export and an object operation.
+          # A power cut is only run against object operations.
           - { fault: power, op: start }
-          - { fault: power, cell: { identity: inode, fs: local } }
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
 
