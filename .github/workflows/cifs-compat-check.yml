@@ -40,12 +40,20 @@ on:
         description: Optional nextest filter expression or test name substring for the rustfs-ecstore tests (empty = whole crate)
         type: string
         default: ""
+      source_ref:
+        description: Git ref whose sources the rustfs-ecstore test job checks out (empty = this ref), e.g. an upstream tag for a baseline
+        type: string
+        default: ""
+      repeat:
+        description: How often the rustfs-ecstore test job repeats the selected tests (flake rate measurement)
+        type: number
+        default: 1
 
 permissions:
   contents: read
 
 concurrency:
-  group: cifs-compat-check-${{ github.ref }}-${{ github.event_name }}
+  group: cifs-compat-check-${{ github.ref }}-${{ github.event_name }}-${{ inputs.source_ref }}-${{ inputs.test_filter }}
   cancel-in-progress: true
 
 env:
@@ -110,6 +118,7 @@ jobs:
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
+          ref: ${{ inputs.source_ref }}
           persist-credentials: false
 
       - name: Setup Rust environment
@@ -128,6 +137,7 @@ jobs:
         env:
           NEXTEST_HIDE_PROGRESS_BAR: "1"
           TEST_FILTER: ${{ inputs.test_filter }}
+          REPEAT: ${{ inputs.repeat || 1 }}
         run: |
           args=()
           if [[ -n "$TEST_FILTER" ]]; then
@@ -139,8 +149,15 @@ jobs:
               args+=("$TEST_FILTER")
             fi
           fi
-          cargo nextest run --locked --profile ci -p rustfs-ecstore --no-tests fail \
-            --status-level all --final-status-level all "${args[@]}"
+          failed=0
+          for round in $(seq 1 "$REPEAT"); do
+            echo "::group::round $round of $REPEAT"
+            cargo nextest run --locked --profile ci -p rustfs-ecstore --no-tests fail \
+              --status-level all --final-status-level all "${args[@]}" || failed=$((failed + 1))
+            echo "::endgroup::"
+          done
+          echo "rounds=$REPEAT failed_rounds=$failed"
+          [[ "$failed" -eq 0 ]]
 
   # Mirrors the whole-workspace test lane of ci.yml on a hosted runner, run as a
   # single job like upstream's default (non-rehearsal) path:

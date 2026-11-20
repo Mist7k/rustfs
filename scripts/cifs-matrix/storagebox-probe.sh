@@ -221,7 +221,8 @@ run_cell() {
   rm -rf -- "$out"
   mkdir "$T/$label"
   echo "=== cell $label ==="
-  CELL_DATA_DIR="$T/$label" RUSTFS_EXTRA_ENV="$extra" timeout 900     bash "$SCRIPT_DIR/run-matrix-cell.sh" "$label" external "$bin" "$out" &
+  CELL_DATA_DIR="$T/$label" RUSTFS_EXTRA_ENV="$extra" timeout 900 \
+    bash "$SCRIPT_DIR/run-matrix-cell.sh" "$label" external "$bin" "$out" &
   CELL_PID=$!
   wait "$CELL_PID" || echo "cell $label exited non-zero (data, not a probe failure)"
   CELL_PID=""
@@ -247,21 +248,19 @@ fi
 
 # ---------------------------------------------------------------- summary ----
 echo "=== SUMMARY ==="
-printf '%-24s %s
-' cell "s1   s2   s3   s4   s5   s6"
+printf '%-24s %s\n' cell "s1   s2   s3   s4   s5   s6"
 for label in $CELLS; do
   f="$OUT_ROOT/$label/steps.tsv"
   line=""
   for id in 1 2 3 4 5 6; do
     st="-"
     if [[ -f "$f" ]]; then
-      st="$(awk -F'	' -v i="$id" '$1 == i {print $3; exit}' "$f")"
+      st="$(awk -F'\t' -v i="$id" '$1 == i {print $3; exit}' "$f")"
       st="${st:--}"
     fi
     line+="$(printf '%-4s ' "$st")"
   done
-  printf '%-24s %s
-' "$label" "$line"
+  printf '%-24s %s\n' "$label" "$line"
 done
 
 exit 0
