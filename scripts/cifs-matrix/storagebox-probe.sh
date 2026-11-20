@@ -27,6 +27,10 @@
 #   SB_ROOT       mount root (default /sb)
 #   RUSTFS_TAGS   whitespace separated upstream release tags
 #                 (default "1.0.0-beta.8 1.0.2 1.0.6")
+#                 (may be set empty to skip release cells)
+#   PROBE_LOCAL_BIN    rustfs binary on the container-local disk (optional)
+#   PROBE_LOCAL_CELLS  whitespace separated "label:KEY=VALUE" cells run with
+#                      PROBE_LOCAL_BIN, e.g. "branch-content:RUSTFS_FS_IDENTITY_MODE=content"
 #
 # Exit codes: 0 probe ran (step FAILs are data), 3 precondition failed,
 #             4 tooling/download failed.
@@ -34,7 +38,9 @@
 set -euo pipefail
 
 SB_ROOT="${SB_ROOT:-/sb}"
-RUSTFS_TAGS="${RUSTFS_TAGS:-1.0.0-beta.8 1.0.2 1.0.6}"
+RUSTFS_TAGS="${RUSTFS_TAGS-1.0.0-beta.8 1.0.2 1.0.6}"
+PROBE_LOCAL_BIN="${PROBE_LOCAL_BIN:-}"
+PROBE_LOCAL_CELLS="${PROBE_LOCAL_CELLS:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_ROOT="/tmp/rustfs-bin"
 DL_DIR="/tmp/rustfs-dl"
@@ -204,42 +210,58 @@ PY
     echo "WARN: download/extract failed for $tag, skipping" >&2
   fi
 done
-[[ -n "$DL_OK" ]] || die 4 "no rustfs release could be downloaded"
+[[ -n "$DL_OK" || -z "${RUSTFS_TAGS//[[:space:]]/}" ]] || die 4 "no rustfs release could be downloaded"
 
 # ------------------------------------------------------------------ cells ----
-for tag in $DL_OK; do
-  out="$OUT_ROOT/$tag"
-  rm -rf -- "$out"
-  mkdir "$T/$tag"
-  echo "=== cell $tag ==="
-  CELL_DATA_DIR="$T/$tag" timeout 900 \
-    bash "$SCRIPT_DIR/run-matrix-cell.sh" "release-$tag" external "$BIN_ROOT/$tag/rustfs" "$out" &
-  CELL_PID=$!
-  wait "$CELL_PID" || echo "cell $tag exited non-zero (data, not a probe failure)"
-  CELL_PID=""
+CELLS=""
 
-  echo "=== signatures $tag ==="
+# run_cell <label> <binary> [extra rustfs env]
+run_cell() {
+  local label="$1" bin="$2" extra="${3:-}" out="$OUT_ROOT/$1"
+  rm -rf -- "$out"
+  mkdir "$T/$label"
+  echo "=== cell $label ==="
+  CELL_DATA_DIR="$T/$label" RUSTFS_EXTRA_ENV="$extra" timeout 900     bash "$SCRIPT_DIR/run-matrix-cell.sh" "$label" external "$bin" "$out" &
+  CELL_PID=$!
+  wait "$CELL_PID" || echo "cell $label exited non-zero (data, not a probe failure)"
+  CELL_PID=""
+  CELLS="$CELLS $label"
+
+  echo "=== signatures $label ==="
   if [[ -f "$out/rustfs.log" ]]; then
     { grep -E "$SIG_RE" "$out/rustfs.log" | head -n 15 | cut -c1-700; } || true
   fi
   [[ -f "$out/steps.tsv" ]] && tail -n 5 "$out/steps.tsv" || true
+}
+
+for tag in $DL_OK; do
+  run_cell "release-$tag" "$BIN_ROOT/$tag/rustfs"
 done
+
+# Optional cells for a binary the caller placed on the container-local disk.
+if [[ -n "$PROBE_LOCAL_BIN" ]]; then
+  for cell in $PROBE_LOCAL_CELLS; do
+    run_cell "${cell%%:*}" "$PROBE_LOCAL_BIN" "${cell#*:}"
+  done
+fi
 
 # ---------------------------------------------------------------- summary ----
 echo "=== SUMMARY ==="
-printf '%-18s %s\n' tag "s1   s2   s3   s4   s5   s6"
-for tag in $RUSTFS_TAGS; do
-  f="$OUT_ROOT/$tag/steps.tsv"
+printf '%-24s %s
+' cell "s1   s2   s3   s4   s5   s6"
+for label in $CELLS; do
+  f="$OUT_ROOT/$label/steps.tsv"
   line=""
   for id in 1 2 3 4 5 6; do
     st="-"
     if [[ -f "$f" ]]; then
-      st="$(awk -F'\t' -v i="$id" '$1 == i {print $3; exit}' "$f")"
+      st="$(awk -F'	' -v i="$id" '$1 == i {print $3; exit}' "$f")"
       st="${st:--}"
     fi
     line+="$(printf '%-4s ' "$st")"
   done
-  printf '%-18s %s\n' "$tag" "$line"
+  printf '%-24s %s
+' "$label" "$line"
 done
 
 exit 0
