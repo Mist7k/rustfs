@@ -370,7 +370,7 @@ AWS_ERR=""
 # s3api <args...>: stdout is the aws output; stderr is kept in AWS_ERR.
 s3api() {
   local errf="$TMP/aws.err" rc=0
-  timeout 180 aws --no-cli-pager --endpoint-url "$ENDPOINT" \
+  timeout 180 aws --endpoint-url "$ENDPOINT" \
     --cli-connect-timeout 10 --cli-read-timeout 120 \
     s3api "$@" 2> "$errf" || rc=$?
   AWS_ERR="$(tr '\n' ' ' < "$errf" | cut -c1-400)"
