@@ -4221,7 +4221,9 @@ pub(crate) fn prepare_pool_meta_owned_backup_with_mode(
         )?);
         let written = std::io::Write::write_all(&mut file, expected).and_then(|()| {
             if mode == super::identity::IdentityMode::Content {
-                verify_backup_copy(&file, expected)
+                // A hardlink shares the predecessor's durable inode. A copy has to reach stable
+                // storage itself before it can stand in for it, whatever the caller's sync policy.
+                verify_backup_copy(&file, expected).and_then(|()| file.sync_data())
             } else {
                 Ok(())
             }

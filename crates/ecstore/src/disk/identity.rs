@@ -199,6 +199,9 @@ fn same_file_metadata_without_inode(a: &std::fs::Metadata, b: &std::fs::Metadata
         && a.permissions() == b.permissions()
         && a.mtime() == b.mtime()
         && a.mtime_nsec() == b.mtime_nsec()
+        // A replaced file can keep length and mtime, but its change time cannot be forged.
+        && a.ctime() == b.ctime()
+        && a.ctime_nsec() == b.ctime_nsec()
 }
 
 #[cfg(not(unix))]
@@ -332,6 +335,29 @@ mod tests {
         assert!(sha256_at(&file, 6).is_ok());
         assert_eq!(sha256_at(&file, 5).expect_err("trailing bytes").kind(), io::ErrorKind::InvalidData);
         assert_eq!(sha256_at(&file, 7).expect_err("short read").kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn content_mode_metadata_detects_a_replacement_that_keeps_length_and_mtime() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("file");
+        let replacement = dir.path().join("replacement");
+        fs::write(&path, b"bytes").expect("write file");
+        let before = fs::metadata(&path).expect("metadata");
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&replacement, b"other").expect("write replacement");
+        fs::File::options()
+            .write(true)
+            .open(&replacement)
+            .and_then(|file| file.set_modified(before.modified()?))
+            .expect("copy modification time");
+        fs::rename(&replacement, &path).expect("replace file");
+
+        let after = fs::metadata(&path).expect("metadata");
+        assert_eq!(after.len(), before.len());
+        assert_eq!(after.modified().expect("mtime"), before.modified().expect("mtime"));
+        assert!(!same_file_metadata(&before, &after, IdentityMode::Content));
     }
 
     #[test]
