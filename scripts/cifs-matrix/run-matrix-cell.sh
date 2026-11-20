@@ -30,6 +30,14 @@
 #                      /tmp/cifs-matrix for fs=external)
 #   CELL_DATA_DIR      data dir, required for fs=external
 #   CELL_PORT          rustfs listen port (default 9000)
+#   CELL_MODE          steps (default) | crash
+#   CRASH_OP           crash mode: put | overwrite | multipart | start
+#   CRASH_ITERATIONS   crash mode: kill -9 rounds (default 100)
+#
+# Crash mode kills rustfs with SIGKILL at a random point of one operation per
+# round, restarts it and checks: rustfs becomes ready again, every acknowledged
+# object reads back with its sha256, an unacknowledged object is either absent
+# or complete (overwrite: old or new content, never absent).
 
 set -euo pipefail
 
@@ -500,6 +508,297 @@ step_restart() {
   rec 6 "$name" PASS "verified: ${checked:-none (ready only)}"
 }
 
+# ------------------------------------------------------------ crash mode ----
+CRASH_OP="${CRASH_OP:-put}"
+CRASH_ITER="${CRASH_ITERATIONS:-100}"
+CRASH_TSV="$OUT_DIR/crash.tsv"
+declare -A ACKED=()
+N_ACKED=0
+N_UNACKED_ABSENT=0
+N_UNACKED_PRESENT=0
+N_BAD=0
+CRASH_ABORT=""
+
+kill_rustfs() {
+  [[ -n "$RUSTFS_PID" ]] || return 0
+  kill -KILL "$RUSTFS_PID" 2>/dev/null || true
+  wait "$RUSTFS_PID" 2>/dev/null || true
+  RUSTFS_PID=""
+}
+
+now_ms() { date +%s%3N; }
+
+# rand_ms <lo> <hi>: uniform integer in [lo, hi]
+rand_ms() {
+  local lo="$1" hi="$2"
+  if (( hi <= lo )); then echo "$lo"; return 0; fi
+  echo $(( lo + (RANDOM * 32768 + RANDOM) % (hi - lo + 1) ))
+}
+
+sleep_ms() { sleep "$(printf '%d.%03d' $(( $1 / 1000 )) $(( $1 % 1000 )))"; }
+
+# object_state <key> <sha>...: prints absent | match:<sha> | bad:<reason>
+object_state() {
+  local key="$1" f="$TMP/state.bin" got want
+  shift
+  rm -f "$f"
+  if ! s3api get-object --bucket "$BUCKET" --key "$key" "$f" >/dev/null; then
+    if [[ "$AWS_ERR" == *NoSuchKey* || "$AWS_ERR" == *"(404)"* ]]; then
+      echo absent
+    else
+      echo "bad:get failed: $AWS_ERR"
+    fi
+    return 0
+  fi
+  got="$(sha "$f")"
+  for want in "$@"; do
+    if [[ "$got" == "$want" ]]; then echo "match:$want"; return 0; fi
+  done
+  echo "bad:sha256 mismatch"
+}
+
+# crash_rec <round> <delay-ms> <acked> <state> <verdict>
+crash_rec() {
+  printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" >> "$CRASH_TSV"
+  if [[ "$5" != ok ]]; then
+    N_BAD=$((N_BAD + 1))
+    log "round $1: VIOLATION delay=${2}ms acked=$3 state=$4"
+  fi
+}
+
+# restart_after_kill <round>: 0 when rustfs is ready again.
+restart_after_kill() {
+  start_rustfs "crash round $1"
+  if wait_ready 120; then return 0; fi
+  CRASH_ABORT="round $1: not ready after kill: $READY_NOTE"
+  return 1
+}
+
+# CLI_MS: time of a request without payload (mostly aws cli start-up).
+CLI_MS=0
+calibrate_cli() {
+  local t0 t1
+  t0="$(now_ms)"
+  s3api head-bucket --bucket "$BUCKET" >/dev/null || true
+  t1="$(now_ms)"
+  CLI_MS=$((t1 - t0))
+}
+
+# run_killed <round> <lo-ms> <hi-ms> <s3api args...>: runs the request in the
+# background and kills rustfs after a random delay. Sets KILL_DELAY, KILL_ACKED.
+KILL_DELAY=0
+KILL_ACKED=no
+run_killed() {
+  local round="$1" lo="$2" hi="$3" client rc=0
+  shift 3
+  echo "=== $(date -u +%FT%TZ) crash round $round ($CRASH_OP) ===" >> "$LOG"
+  KILL_DELAY="$(rand_ms "$lo" "$hi")"
+  ( s3api "$@" >/dev/null ) &
+  client=$!
+  sleep_ms "$KILL_DELAY"
+  kill_rustfs
+  wait "$client" || rc=$?
+  if [[ "$rc" == 0 ]]; then KILL_ACKED=yes; else KILL_ACKED=no; fi
+}
+
+# judge <round> <key> <acked> <new-sha> [old-sha]: records the round. With
+# old-sha the object must never be absent. Sets JUDGED_SHA to the sha now
+# stored ("" when absent or wrong).
+JUDGED_SHA=""
+judge() {
+  local round="$1" key="$2" acked="$3" new="$4" old="${5:-}" state verdict=ok
+  state="$(object_state "$key" "$new" ${old:+"$old"})"
+  JUDGED_SHA=""
+  case "$state" in
+    match:"$new")
+      JUDGED_SHA="$new"
+      if [[ "$acked" == yes ]]; then
+        N_ACKED=$((N_ACKED + 1))
+      else
+        N_UNACKED_PRESENT=$((N_UNACKED_PRESENT + 1))
+      fi ;;
+    match:*)
+      JUDGED_SHA="$old"
+      if [[ "$acked" == yes ]]; then verdict=bad; else N_UNACKED_ABSENT=$((N_UNACKED_ABSENT + 1)); fi ;;
+    absent)
+      if [[ "$acked" == yes || -n "$old" ]]; then verdict=bad; else N_UNACKED_ABSENT=$((N_UNACKED_ABSENT + 1)); fi ;;
+    *) verdict=bad ;;
+  esac
+  crash_rec "$round" "$KILL_DELAY" "$acked" "${state:0:200}" "$verdict"
+}
+
+crash_put() {
+  local i t0 t1 hi key new
+  head -c 4194304 /dev/urandom > "$TMP/c.bin"
+  t0="$(now_ms)"
+  if ! s3api put-object --bucket "$BUCKET" --key calib --body "$TMP/c.bin" >/dev/null; then
+    CRASH_ABORT="calibration put: $AWS_ERR"; return 0
+  fi
+  t1="$(now_ms)"
+  hi=$(( (t1 - t0) * 11 / 10 ))
+  log "put window: $((CLI_MS * 8 / 10))..${hi} ms"
+  for i in $(seq 1 "$CRASH_ITER"); do
+    key="k$i"
+    head -c 4194304 /dev/urandom > "$TMP/c.bin"
+    new="$(sha "$TMP/c.bin")"
+    run_killed "$i" $((CLI_MS * 8 / 10)) "$hi" put-object --bucket "$BUCKET" --key "$key" --body "$TMP/c.bin"
+    restart_after_kill "$i" || return 0
+    judge "$i" "$key" "$KILL_ACKED" "$new"
+    if [[ -n "$JUDGED_SHA" ]]; then ACKED["$key"]="$JUDGED_SHA"; fi
+  done
+}
+
+crash_overwrite() {
+  local i t0 t1 hi new cur
+  head -c 4194304 /dev/urandom > "$TMP/c.bin"
+  cur="$(sha "$TMP/c.bin")"
+  t0="$(now_ms)"
+  if ! s3api put-object --bucket "$BUCKET" --key ow --body "$TMP/c.bin" >/dev/null; then
+    CRASH_ABORT="initial put: $AWS_ERR"; return 0
+  fi
+  t1="$(now_ms)"
+  hi=$(( (t1 - t0) * 11 / 10 ))
+  log "overwrite window: $((CLI_MS * 8 / 10))..${hi} ms"
+  for i in $(seq 1 "$CRASH_ITER"); do
+    head -c 4194304 /dev/urandom > "$TMP/c.bin"
+    new="$(sha "$TMP/c.bin")"
+    run_killed "$i" $((CLI_MS * 8 / 10)) "$hi" put-object --bucket "$BUCKET" --key ow --body "$TMP/c.bin"
+    restart_after_kill "$i" || return 0
+    judge "$i" ow "$KILL_ACKED" "$new" "$cur"
+    if [[ -n "$JUDGED_SHA" ]]; then
+      cur="$JUDGED_SHA"
+    else
+      # State unknown after a violation: write a known version to go on.
+      if ! s3api put-object --bucket "$BUCKET" --key ow --body "$TMP/c.bin" >/dev/null; then
+        CRASH_ABORT="round $i: recovery put: $AWS_ERR"; return 0
+      fi
+      cur="$new"
+    fi
+    ACKED[ow]="$cur"
+  done
+}
+
+MP_UID=""
+MP_SHA=""
+# mp_prepare <key>: uploads two parts (5 MiB + 1 MiB) and writes cparts.json.
+mp_prepare() {
+  local key="$1" n etag parts="" sep=""
+  MP_UID="$(s3api create-multipart-upload --bucket "$BUCKET" --key "$key" --query UploadId --output text)" || return 1
+  head -c 5242880 /dev/urandom > "$TMP/cp1.bin"
+  head -c 1048576 /dev/urandom > "$TMP/cp2.bin"
+  for n in 1 2; do
+    etag="$(s3api upload-part --bucket "$BUCKET" --key "$key" --upload-id "$MP_UID" \
+      --part-number "$n" --body "$TMP/cp$n.bin" --query ETag --output json)" || return 1
+    parts+="${sep}{\"ETag\":${etag},\"PartNumber\":${n}}"
+    sep=","
+  done
+  printf '{"Parts":[%s]}' "$parts" > "$TMP/cparts.json"
+  MP_SHA="$(cat "$TMP/cp1.bin" "$TMP/cp2.bin" | sha256sum | cut -d' ' -f1)"
+}
+
+crash_multipart() {
+  local i t0 t1 hi key
+  if ! mp_prepare calib; then CRASH_ABORT="calibration upload: $AWS_ERR"; return 0; fi
+  t0="$(now_ms)"
+  if ! s3api complete-multipart-upload --bucket "$BUCKET" --key calib --upload-id "$MP_UID" \
+      --multipart-upload "file://$TMP/cparts.json" >/dev/null; then
+    CRASH_ABORT="calibration complete: $AWS_ERR"; return 0
+  fi
+  t1="$(now_ms)"
+  hi=$(( (t1 - t0) * 11 / 10 ))
+  log "complete-multipart window: $((CLI_MS * 8 / 10))..${hi} ms"
+  for i in $(seq 1 "$CRASH_ITER"); do
+    key="m$i"
+    if ! mp_prepare "$key"; then CRASH_ABORT="round $i: upload parts: $AWS_ERR"; return 0; fi
+    run_killed "$i" $((CLI_MS * 8 / 10)) "$hi" complete-multipart-upload --bucket "$BUCKET" --key "$key" \
+      --upload-id "$MP_UID" --multipart-upload "file://$TMP/cparts.json"
+    restart_after_kill "$i" || return 0
+    judge "$i" "$key" "$KILL_ACKED" "$MP_SHA"
+    if [[ -n "$JUDGED_SHA" ]]; then
+      ACKED["$key"]="$JUDGED_SHA"
+    else
+      s3api abort-multipart-upload --bucket "$BUCKET" --key "$key" --upload-id "$MP_UID" >/dev/null || true
+    fi
+  done
+}
+
+# Kills rustfs during start-up. The data dir already holds objects.
+crash_start() {
+  local i n t0 t1 hi delay state verdict key
+  for n in 1 2 3; do
+    head -c 1048576 /dev/urandom > "$TMP/c.bin"
+    if ! s3api put-object --bucket "$BUCKET" --key "s$n" --body "$TMP/c.bin" >/dev/null; then
+      CRASH_ABORT="seed put: $AWS_ERR"; return 0
+    fi
+    ACKED["s$n"]="$(sha "$TMP/c.bin")"
+  done
+  kill_rustfs
+  t0="$(now_ms)"
+  restart_after_kill calibration || return 0
+  t1="$(now_ms)"
+  hi=$(( (t1 - t0) * 11 / 10 ))
+  log "start window: 0..${hi} ms"
+  for i in $(seq 1 "$CRASH_ITER"); do
+    kill_rustfs
+    start_rustfs "crash round $i (killed during start)"
+    delay="$(rand_ms 0 "$hi")"
+    sleep_ms "$delay"
+    kill_rustfs
+    restart_after_kill "$i" || return 0
+    key="s$(( i % 3 + 1 ))"
+    verdict=ok
+    state="$(object_state "$key" "${ACKED[$key]}")"
+    if [[ "$state" == match:* ]]; then N_ACKED=$((N_ACKED + 1)); else verdict=bad; fi
+    crash_rec "$i" "$delay" n/a "${state:0:200}" "$verdict"
+  done
+}
+
+# Kills rustfs during its very first start on an empty data dir.
+crash_fresh_start() {
+  local i delay
+  for i in $(seq 1 20); do
+    start_rustfs "fresh start round $i (killed)"
+    delay="$(rand_ms 0 4000)"
+    sleep_ms "$delay"
+    kill_rustfs
+    printf 'fresh-%s\t%s\tn/a\tn/a\tok\n' "$i" "$delay" >> "$CRASH_TSV"
+  done
+}
+
+step_crash() {
+  local name="crash loop: $CRASH_OP" key state sweep_bad=0 rounds note
+  if [[ "${STATUS[2]}" != PASS ]]; then rec 3 "$name" SKIP "no bucket"; return 0; fi
+  calibrate_cli
+  case "$CRASH_OP" in
+    put)       crash_put ;;
+    overwrite) crash_overwrite ;;
+    multipart) crash_multipart ;;
+    start)     crash_start ;;
+    *) echo "unknown CRASH_OP: $CRASH_OP" >&2; exit 2 ;;
+  esac
+  rounds="$(grep -c -v '^fresh-' "$CRASH_TSV" || true)"
+  note="rounds=$rounds acked=$N_ACKED unacked_absent_or_old=$N_UNACKED_ABSENT unacked_complete=$N_UNACKED_PRESENT violations=$N_BAD"
+  if [[ -n "$CRASH_ABORT" ]]; then
+    rec 3 "$name" FAIL "$CRASH_ABORT; $note"
+    rec 4 "final sweep of acknowledged objects" SKIP "loop aborted"
+    return 0
+  fi
+  if (( N_BAD > 0 )); then rec 3 "$name" FAIL "$note"; else rec 3 "$name" PASS "$note"; fi
+
+  for key in "${!ACKED[@]}"; do
+    state="$(object_state "$key" "${ACKED[$key]}")"
+    if [[ "$state" != match:* ]]; then
+      sweep_bad=$((sweep_bad + 1))
+      log "final sweep: $key $state"
+    fi
+  done
+  if (( sweep_bad > 0 )); then
+    rec 4 "final sweep of acknowledged objects" FAIL "$sweep_bad of ${#ACKED[@]} objects wrong"
+  else
+    rec 4 "final sweep of acknowledged objects" PASS "${#ACKED[@]} objects"
+  fi
+}
+
 # ------------------------------------------------------------------ main ----
 log "binary: $BIN"
 "$BIN" --version 2>&1 | head -3 > "$OUT_DIR/version.txt" || true
@@ -507,12 +806,20 @@ log "binary: $BIN"
 prepare_fs
 inode_probe
 
-step_start
-step_bucket
-step_simple
-step_multipart
-step_delete
-step_restart
+if [[ "${CELL_MODE:-steps}" == crash ]]; then
+  : > "$CRASH_TSV"
+  if [[ "$CRASH_OP" == start ]]; then crash_fresh_start; fi
+  step_start
+  step_bucket
+  step_crash
+else
+  step_start
+  step_bucket
+  step_simple
+  step_multipart
+  step_delete
+  step_restart
+fi
 
 stop_rustfs
 if [[ "$IS_CIFS" == 1 ]]; then

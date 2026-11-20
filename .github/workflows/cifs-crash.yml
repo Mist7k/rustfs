@@ -1,0 +1,107 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Crash test for the CIFS identity modes: rustfs is killed with SIGKILL at a
+# random point of one operation per round, restarted and checked. The binary
+# comes from the newest "CIFS Matrix" run of this branch that still has its
+# build artifact, so this workflow does not compile anything.
+
+name: CIFS Crash
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ cifs-compat ]
+    paths:
+      - .github/workflows/cifs-crash.yml
+      - scripts/cifs-matrix/run-matrix-cell.sh
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: cifs-crash-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dm-probe:
+    name: device-mapper targets on the runner
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Probe
+        run: |
+          uname -r
+          for m in dm-mod dm-flakey dm-delay dm-log-writes; do
+            if sudo modprobe "$m"; then echo "modprobe $m: ok"; else echo "modprobe $m: FAILED"; fi
+          done
+          sudo dmsetup targets || true
+
+  crash:
+    name: ${{ matrix.op }} / ${{ matrix.cell.identity }} / ${{ matrix.cell.fs }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        op: [ put, overwrite, multipart, start ]
+        cell:
+          - { identity: content, fs: cifs-noserverino }
+          - { identity: inode, fs: cifs-serverino }
+          - { identity: inode, fs: local }
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+
+      - name: Download branch binary from the newest CIFS Matrix run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/rustfs-bin"
+          found=""
+          while read -r id sha; do
+            if gh run download "$id" --repo "$GITHUB_REPOSITORY" \
+                --name rustfs-branch-binary --dir "$RUNNER_TEMP/rustfs-bin" 2>/dev/null; then
+              found="$id $sha"
+              break
+            fi
+          done < <(gh run list --repo "$GITHUB_REPOSITORY" --workflow cifs-matrix.yml \
+            --branch cifs-compat --limit 20 --json databaseId,headSha \
+            --jq '.[] | "\(.databaseId) \(.headSha)"')
+          test -n "$found"
+          echo "binary from run/commit: $found" | tee -a "$GITHUB_STEP_SUMMARY"
+          chmod +x "$RUNNER_TEMP/rustfs-bin/rustfs"
+
+      - name: Run crash cell
+        env:
+          TARGET: crash-${{ matrix.op }}-${{ matrix.cell.identity }}
+          FS: ${{ matrix.cell.fs }}
+          CELL_MODE: crash
+          CRASH_OP: ${{ matrix.op }}
+          CRASH_ITERATIONS: "100"
+          RUSTFS_EXTRA_ENV: RUSTFS_FS_IDENTITY_MODE=${{ matrix.cell.identity }} RUSTFS_ISSUE3031_DIAG_ENABLE=true
+        run: |
+          bash scripts/cifs-matrix/run-matrix-cell.sh \
+            "$TARGET" "$FS" "$RUNNER_TEMP/rustfs-bin/rustfs" \
+            "$GITHUB_WORKSPACE/cifs-crash-out"
+
+      - name: Upload cell results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cifs-crash-${{ matrix.op }}-${{ matrix.cell.identity }}-${{ matrix.cell.fs }}
+          path: cifs-crash-out
+          if-no-files-found: warn
+          retention-days: 14
