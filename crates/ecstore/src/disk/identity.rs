@@ -130,7 +130,10 @@ pub(crate) fn sha256_at(file: &std::fs::File, length: u64) -> io::Result<[u8; 32
     use sha2::{Digest, Sha256};
     use std::os::unix::fs::FileExt;
     if length > CONTENT_IDENTITY_MAX_BYTES {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "file identity length exceeds the content bound"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file identity length exceeds the content bound",
+        ));
     }
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; CONTENT_IDENTITY_READ_CHUNK_BYTES];
@@ -340,11 +343,23 @@ mod tests {
         fs::hard_link(&path, &link).expect("create hardlink");
         let before = fs::metadata(&path).expect("metadata");
 
-        assert!(same_file_metadata(&before, &fs::metadata(&path).expect("metadata"), IdentityMode::Content));
-        assert!(same_file_metadata(&before, &fs::metadata(&link).expect("metadata"), IdentityMode::Content));
+        assert!(same_file_metadata(
+            &before,
+            &fs::metadata(&path).expect("metadata"),
+            IdentityMode::Content
+        ));
+        assert!(same_file_metadata(
+            &before,
+            &fs::metadata(&link).expect("metadata"),
+            IdentityMode::Content
+        ));
 
         fs::write(&path, b"longer bytes").expect("rewrite with another length");
-        assert!(!same_file_metadata(&before, &fs::metadata(&path).expect("metadata"), IdentityMode::Content));
+        assert!(!same_file_metadata(
+            &before,
+            &fs::metadata(&path).expect("metadata"),
+            IdentityMode::Content
+        ));
 
         let file = fs::OpenOptions::new().write(true).open(&path).expect("open for write");
         file.set_len(5).expect("restore length");

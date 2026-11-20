@@ -1397,8 +1397,8 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
 
         let (_dir, root, base, source, backup_path) = content_mode_backup_fixture();
-        let prepared = prepare_content_mode_backup(&source, &backup_path, &base, &root, b"predecessor")
-            .expect("content mode backup");
+        let prepared =
+            prepare_content_mode_backup(&source, &backup_path, &base, &root, b"predecessor").expect("content mode backup");
         assert!(!prepared.is_linked());
         assert_eq!(std::fs::read(&backup_path).expect("backup bytes"), b"predecessor");
         let source_metadata = std::fs::metadata(&source).expect("source metadata");
@@ -1430,8 +1430,8 @@ mod tests {
 
         for replace_source in [true, false] {
             let (dir, root, base, source, backup_path) = content_mode_backup_fixture();
-            let prepared = prepare_content_mode_backup(&source, &backup_path, &base, &root, b"predecessor")
-                .expect("content mode backup");
+            let prepared =
+                prepare_content_mode_backup(&source, &backup_path, &base, &root, b"predecessor").expect("content mode backup");
             let target = if replace_source { &source } else { &backup_path };
             let replacement = dir.path().join("replacement");
 
