@@ -95,6 +95,11 @@ case "$FS" in
   *) echo "unknown fs: $FS" >&2; exit 2 ;;
 esac
 
+case "${CRASH_FAULT:-kill}" in
+  kill|power) ;;
+  *) echo "unknown CRASH_FAULT: $CRASH_FAULT" >&2; exit 2 ;;
+esac
+
 if [[ "$IS_EXTERNAL" == 1 ]]; then
   if [[ -z "${CELL_DATA_DIR:-}" || ! -d "$CELL_DATA_DIR" ]]; then
     echo "fs=external requires CELL_DATA_DIR to be an existing directory" >&2
@@ -848,7 +853,7 @@ crash_fresh_start() {
 }
 
 step_crash() {
-  local name="crash loop: $CRASH_OP" key state sweep_bad=0 rounds note
+  local name="crash loop: $CRASH_OP" key state sweep_bad=0 rounds note n_yes n_no
   if [[ "${STATUS[2]}" != PASS ]]; then rec 3 "$name" SKIP "no bucket"; return 0; fi
   calibrate_cli
   if [[ "$CRASH_FAULT" == power ]]; then
@@ -873,7 +878,17 @@ step_crash() {
     rec 4 "final sweep of acknowledged objects" SKIP "loop aborted"
     return 0
   fi
-  if (( N_BAD > 0 )); then rec 3 "$name" FAIL "$note"; else rec 3 "$name" PASS "$note"; fi
+  # A loop in which the kill never came before or never came after the
+  # acknowledgement has not tested the commit and must not count as passed.
+  n_yes="$(awk -F'	' '$3 == "yes"' "$CRASH_TSV" | wc -l)"
+  n_no="$(awk -F'	' '$3 == "no"' "$CRASH_TSV" | wc -l)"
+  if (( N_BAD > 0 )); then
+    rec 3 "$name" FAIL "$note"
+  elif [[ "$CRASH_OP" != start ]] && (( n_yes == 0 || n_no == 0 )); then
+    rec 3 "$name" FAIL "kill window missed: acknowledged=$n_yes unacknowledged=$n_no; $note"
+  else
+    rec 3 "$name" PASS "$note"
+  fi
 
   for key in "${!ACKED[@]}"; do
     state="$(object_state "$key" "${ACKED[$key]}")"
