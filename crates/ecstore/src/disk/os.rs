@@ -4274,7 +4274,7 @@ pub(crate) fn prepare_pool_meta_owned_backup_with_mode(
         file
     };
     let directory = std::fs::File::from(backup_directory.try_clone()?);
-    let source = if mode == super::identity::IdentityMode::Content {
+    let predecessor = if mode == super::identity::IdentityMode::Content {
         use sha2::{Digest, Sha256};
         drop(old);
         PoolMetaBackupSource::Released {
@@ -4289,7 +4289,7 @@ pub(crate) fn prepare_pool_meta_owned_backup_with_mode(
         source_path: source.to_path_buf(),
         file,
         directory,
-        source,
+        source: predecessor,
         linked,
         mode,
         _ancestors: (source_guards, backup_guards),
