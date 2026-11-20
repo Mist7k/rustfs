@@ -4347,9 +4347,9 @@ fn log_multipart_part_commit_settle_failure(
     }
 }
 
-/// Logged when no disk reported a failure yet the
-/// part transaction commit could not be confirmed. This is not a write-quorum
-/// loss, so it must not be reported as one.
+/// Logged when no disk reported a failure yet recovery left the part transaction
+/// uncommitted (rolled back or absent). This is not a write-quorum loss, so it
+/// must not be reported as one.
 fn log_multipart_part_commit_unconfirmed(
     context: Option<MultipartWriteQuorumContext<'_>>,
     dst_object: &str,
@@ -4376,7 +4376,7 @@ fn log_multipart_part_commit_unconfirmed(
             failed = summary.failed,
             total = summary.total,
             returned_error = %returned_error,
-            "Set disk multipart part commit unconfirmed"
+            "Set disk multipart part not committed after recovery"
         ),
         None => warn!(
             target: "rustfs_ecstore::set_disk",
@@ -4391,7 +4391,7 @@ fn log_multipart_part_commit_unconfirmed(
             failed = summary.failed,
             total = summary.total,
             returned_error = %returned_error,
-            "Set disk multipart part commit unconfirmed"
+            "Set disk multipart part not committed after recovery"
         ),
     }
 }

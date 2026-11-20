@@ -5807,10 +5807,11 @@ impl SetDisks {
             self.recover_part_transaction(&dst_object, write_quorum).await?
         };
         if !committed {
-            // No disk reported a failure, so this is not a write-quorum loss: the commit simply
-            // could not be confirmed. Report that instead of a quorum error with zero failures.
+            // No disk reported a failure, so this is not a write-quorum loss: recovery found the
+            // transaction rolled back or absent. Report that instead of a quorum error with zero
+            // failures.
             if commit_errs.iter().all(Option::is_none) {
-                let err = DiskError::other("multipart part transaction commit could not be confirmed on any disk");
+                let err = DiskError::other("multipart part transaction was not committed: rolled back or absent after recovery");
                 log_multipart_part_commit_unconfirmed(quorum_context, &dst_object, &commit_errs, write_quorum, &err);
                 return Err(err);
             }
