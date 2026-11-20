@@ -454,7 +454,12 @@ mod tests {
             reduce_write_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, 3),
             Some(Error::ErasureWriteQuorum)
         );
-        let errors = [None, Some(Error::DiskNotFound), Some(Error::DiskNotFound), Some(Error::DiskNotFound)];
+        let errors = [
+            None,
+            Some(Error::DiskNotFound),
+            Some(Error::DiskNotFound),
+            Some(Error::DiskNotFound),
+        ];
         assert_eq!(
             reduce_write_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, 2),
             Some(Error::ErasureWriteQuorum)

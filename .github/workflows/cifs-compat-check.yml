@@ -72,14 +72,13 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
-  # Package-scoped variant of ci.yml "Workspace Lint and Build" / "Run clippy
-  # lints" (python3 scripts/ci_test_artifact.py cargo lint --configuration
-  # workspace == cargo clippy --locked --workspace --all-targets -- -D warnings,
-  # default features). The rustfs binary package is not linted separately: it is
-  # only linted upstream as part of that whole-workspace invocation, and
-  # compiling it pulls in most of the workspace, which is not cheap.
-  clippy-ecstore:
-    name: Clippy (rustfs-ecstore)
+  # Mirrors ci.yml "Workspace Lint and Build" / "Run clippy lints" (python3
+  # scripts/ci_test_artifact.py cargo lint --configuration workspace). A
+  # package-scoped run is not usable: unchanged upstream code fails
+  # `-p rustfs-ecstore --all-targets` on test-only items that only other
+  # workspace members use.
+  clippy:
+    name: Clippy (workspace)
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -96,7 +95,7 @@ jobs:
           install-build-packaging-tools: "false"
 
       - name: Run clippy lints
-        run: cargo clippy --locked -p rustfs-ecstore --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
   # Mirrors ci.yml "Workspace tests" / "Run nextest tests" (--profile ci), scoped
   # to rustfs-ecstore. The crate sets `doctest = false` in its Cargo.toml, so the
@@ -150,8 +149,7 @@ jobs:
   #       "Extract and list workspace tests", "Run nextest tests" (--profile ci),
   #       "Verify workspace execution completeness"
   #   - "Workspace tests" -> "Run ignored ILM integration tests serially"
-  # Not mirrored: workspace clippy (covered by clippy-ecstore for the lint
-  # gate here), the upload/download of the archive between two jobs (the archive
+  # Not mirrored: workspace clippy (covered by the clippy job), the upload/download of the archive between two jobs (the archive
   # is built and consumed inside this one job), the resource sampler and
   # artifact uploads, the optional workspace-shards rehearsal (it needs a
   # same-run shard plan and is not part of upstream's default path), and every
