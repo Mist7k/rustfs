@@ -32,12 +32,18 @@
 #   CELL_PORT          rustfs listen port (default 9000)
 #   CELL_MODE          steps (default) | crash
 #   CRASH_OP           crash mode: put | overwrite | multipart | start
-#   CRASH_ITERATIONS   crash mode: kill -9 rounds (default 100)
+#   CRASH_ITERATIONS   crash mode: rounds (default 100)
+#   CRASH_FAULT        crash mode: kill (default) | power
 #
 # Crash mode kills rustfs with SIGKILL at a random point of one operation per
 # round, restarts it and checks: rustfs becomes ready again, every acknowledged
 # object reads back with its sha256, an unacknowledged object is either absent
 # or complete (overwrite: old or new content, never absent).
+#
+# CRASH_FAULT=power (cifs flavours only) puts the Samba export on ext4 on a
+# device-mapper device and, before the kill, swaps its table to "error": every
+# write the server has not yet made durable is lost, like a power cut on the
+# server. Samba is restarted on the replayed filesystem afterwards.
 
 set -euo pipefail
 
@@ -146,6 +152,11 @@ cleanup() {
       sudo umount "$MNT" 2>/dev/null || sudo umount -l "$MNT" 2>/dev/null
     fi
     docker rm -f "$CONTAINER" >/dev/null 2>&1
+    if [[ -n "${DM_LOOP:-}" ]]; then
+      sudo umount "$EXPORT" 2>/dev/null
+      sudo dmsetup remove "$DM_NAME" 2>/dev/null
+      sudo losetup -d "$DM_LOOP" 2>/dev/null
+    fi
   fi
   return 0
 }
@@ -153,6 +164,42 @@ trap cleanup EXIT
 trap 'exit 143' TERM INT
 
 # ------------------------------------------------------------ filesystem ----
+DM_NAME="cifs-crash-export"
+DM_LOOP=""
+DM_SECTORS=0
+
+# Puts $EXPORT on ext4 on a device-mapper device backed by a sparse file.
+setup_dm() {
+  truncate -s 6G "$WORK/backing.img"
+  DM_LOOP="$(sudo losetup --find --show "$WORK/backing.img")"
+  DM_SECTORS="$(sudo blockdev --getsz "$DM_LOOP")"
+  sudo dmsetup create "$DM_NAME" --table "0 $DM_SECTORS linear $DM_LOOP 0"
+  sudo mkfs.ext4 -q "/dev/mapper/$DM_NAME"
+  sudo mount "/dev/mapper/$DM_NAME" "$EXPORT"
+  sudo chown "$(id -u):$(id -g)" "$EXPORT"
+}
+
+dm_table() {
+  sudo dmsetup suspend --noflush --nolockfs "$DM_NAME"
+  sudo dmsetup load "$DM_NAME" --table "$1"
+  sudo dmsetup resume "$DM_NAME"
+}
+
+# From here every read and write on the export fails.
+power_cut() { dm_table "0 $DM_SECTORS error"; }
+
+# Drops everything the server had not made durable and brings the export back.
+power_restore() {
+  sudo umount -f "$MNT" 2>/dev/null || sudo umount -l "$MNT" || return 1
+  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  sudo umount "$EXPORT" || return 1
+  dm_table "0 $DM_SECTORS linear $DM_LOOP 0" || return 1
+  sudo e2fsck -p "/dev/mapper/$DM_NAME" >/dev/null 2>&1 || true
+  sudo mount "/dev/mapper/$DM_NAME" "$EXPORT" || return 1
+  samba_up || return 1
+  mkdir -p "$DATA"
+}
+
 setup_cifs() {
   log "installing cifs-utils"
   sudo apt-get update -qq
@@ -190,6 +237,11 @@ DOCKERFILE
    valid users = rfs
 SMBCONF
 
+  samba_up
+}
+
+# Starts the samba container on $EXPORT and mounts it on $MNT.
+samba_up() {
   docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
   docker run -d --name "$CONTAINER" \
     -p 127.0.0.1:445:445 \
@@ -273,6 +325,7 @@ prepare_fs() {
   mkdir -p "$EXPORT" "$MNT" "$TMP"
 
   if [[ "$IS_CIFS" == 1 ]]; then
+    if [[ "${CRASH_FAULT:-kill}" == power ]]; then setup_dm; fi
     setup_cifs
     DATA="$MNT/data"
   else
@@ -511,6 +564,7 @@ step_restart() {
 # ------------------------------------------------------------ crash mode ----
 CRASH_OP="${CRASH_OP:-put}"
 CRASH_ITER="${CRASH_ITERATIONS:-100}"
+CRASH_FAULT="${CRASH_FAULT:-kill}"
 CRASH_TSV="$OUT_DIR/crash.tsv"
 declare -A ACKED=()
 N_ACKED=0
@@ -568,6 +622,10 @@ crash_rec() {
 
 # restart_after_kill <round>: 0 when rustfs is ready again.
 restart_after_kill() {
+  if [[ "$CRASH_FAULT" == power ]] && ! power_restore; then
+    CRASH_ABORT="round $1: export did not come back after the power cut"
+    return 1
+  fi
   start_rustfs "crash round $1"
   if wait_ready 120; then return 0; fi
   CRASH_ABORT="round $1: not ready after kill: $READY_NOTE"
@@ -584,21 +642,40 @@ calibrate_cli() {
   CLI_MS=$((t1 - t0))
 }
 
-# run_killed <round> <lo-ms> <hi-ms> <s3api args...>: runs the request in the
-# background and kills rustfs after a random delay. Sets KILL_DELAY, KILL_ACKED.
+# set_window <duration-ms of one undisturbed request>
+WIN_LO=0
+WIN_HI=0
+set_window() {
+  WIN_LO=$((CLI_MS * 8 / 10))
+  WIN_HI=$(( $1 * 11 / 10 ))
+  log "$CRASH_OP window: ${WIN_LO}..${WIN_HI} ms"
+}
+
+# run_killed <round> <s3api args...>: runs the request in the background and
+# kills rustfs after a random delay inside the window. Sets KILL_DELAY and
+# KILL_ACKED. The upper bound follows the outcome so that most kills land
+# before the acknowledgement instead of after it.
 KILL_DELAY=0
 KILL_ACKED=no
 run_killed() {
-  local round="$1" lo="$2" hi="$3" client rc=0
-  shift 3
-  echo "=== $(date -u +%FT%TZ) crash round $round ($CRASH_OP) ===" >> "$LOG"
-  KILL_DELAY="$(rand_ms "$lo" "$hi")"
+  local round="$1" client rc=0
+  shift
+  echo "=== $(date -u +%FT%TZ) crash round $round ($CRASH_OP, $CRASH_FAULT) ===" >> "$LOG"
+  KILL_DELAY="$(rand_ms "$WIN_LO" "$WIN_HI")"
   ( s3api "$@" >/dev/null ) &
   client=$!
   sleep_ms "$KILL_DELAY"
+  if [[ "$CRASH_FAULT" == power ]]; then power_cut; fi
   kill_rustfs
   wait "$client" || rc=$?
-  if [[ "$rc" == 0 ]]; then KILL_ACKED=yes; else KILL_ACKED=no; fi
+  if [[ "$rc" == 0 ]]; then
+    KILL_ACKED=yes
+    WIN_HI=$((WIN_HI * 97 / 100))
+  else
+    KILL_ACKED=no
+    WIN_HI=$((WIN_HI * 101 / 100 + 1))
+  fi
+  if (( WIN_HI < WIN_LO + 50 )); then WIN_HI=$((WIN_LO + 50)); fi
 }
 
 # judge <round> <key> <acked> <new-sha> [old-sha]: records the round. With
@@ -628,20 +705,19 @@ judge() {
 }
 
 crash_put() {
-  local i t0 t1 hi key new
+  local i t0 t1 key new
   head -c 4194304 /dev/urandom > "$TMP/c.bin"
   t0="$(now_ms)"
   if ! s3api put-object --bucket "$BUCKET" --key calib --body "$TMP/c.bin" >/dev/null; then
     CRASH_ABORT="calibration put: $AWS_ERR"; return 0
   fi
   t1="$(now_ms)"
-  hi=$(( (t1 - t0) * 11 / 10 ))
-  log "put window: $((CLI_MS * 8 / 10))..${hi} ms"
+  set_window $((t1 - t0))
   for i in $(seq 1 "$CRASH_ITER"); do
     key="k$i"
     head -c 4194304 /dev/urandom > "$TMP/c.bin"
     new="$(sha "$TMP/c.bin")"
-    run_killed "$i" $((CLI_MS * 8 / 10)) "$hi" put-object --bucket "$BUCKET" --key "$key" --body "$TMP/c.bin"
+    run_killed "$i" put-object --bucket "$BUCKET" --key "$key" --body "$TMP/c.bin"
     restart_after_kill "$i" || return 0
     judge "$i" "$key" "$KILL_ACKED" "$new"
     if [[ -n "$JUDGED_SHA" ]]; then ACKED["$key"]="$JUDGED_SHA"; fi
@@ -649,7 +725,7 @@ crash_put() {
 }
 
 crash_overwrite() {
-  local i t0 t1 hi new cur
+  local i t0 t1 new cur
   head -c 4194304 /dev/urandom > "$TMP/c.bin"
   cur="$(sha "$TMP/c.bin")"
   t0="$(now_ms)"
@@ -657,12 +733,11 @@ crash_overwrite() {
     CRASH_ABORT="initial put: $AWS_ERR"; return 0
   fi
   t1="$(now_ms)"
-  hi=$(( (t1 - t0) * 11 / 10 ))
-  log "overwrite window: $((CLI_MS * 8 / 10))..${hi} ms"
+  set_window $((t1 - t0))
   for i in $(seq 1 "$CRASH_ITER"); do
     head -c 4194304 /dev/urandom > "$TMP/c.bin"
     new="$(sha "$TMP/c.bin")"
-    run_killed "$i" $((CLI_MS * 8 / 10)) "$hi" put-object --bucket "$BUCKET" --key ow --body "$TMP/c.bin"
+    run_killed "$i" put-object --bucket "$BUCKET" --key ow --body "$TMP/c.bin"
     restart_after_kill "$i" || return 0
     judge "$i" ow "$KILL_ACKED" "$new" "$cur"
     if [[ -n "$JUDGED_SHA" ]]; then
@@ -697,7 +772,7 @@ mp_prepare() {
 }
 
 crash_multipart() {
-  local i t0 t1 hi key
+  local i t0 t1 key
   if ! mp_prepare calib; then CRASH_ABORT="calibration upload: $AWS_ERR"; return 0; fi
   t0="$(now_ms)"
   if ! s3api complete-multipart-upload --bucket "$BUCKET" --key calib --upload-id "$MP_UID" \
@@ -705,12 +780,11 @@ crash_multipart() {
     CRASH_ABORT="calibration complete: $AWS_ERR"; return 0
   fi
   t1="$(now_ms)"
-  hi=$(( (t1 - t0) * 11 / 10 ))
-  log "complete-multipart window: $((CLI_MS * 8 / 10))..${hi} ms"
+  set_window $((t1 - t0))
   for i in $(seq 1 "$CRASH_ITER"); do
     key="m$i"
     if ! mp_prepare "$key"; then CRASH_ABORT="round $i: upload parts: $AWS_ERR"; return 0; fi
-    run_killed "$i" $((CLI_MS * 8 / 10)) "$hi" complete-multipart-upload --bucket "$BUCKET" --key "$key" \
+    run_killed "$i" complete-multipart-upload --bucket "$BUCKET" --key "$key" \
       --upload-id "$MP_UID" --multipart-upload "file://$TMP/cparts.json"
     restart_after_kill "$i" || return 0
     judge "$i" "$key" "$KILL_ACKED" "$MP_SHA"
@@ -769,6 +843,14 @@ step_crash() {
   local name="crash loop: $CRASH_OP" key state sweep_bad=0 rounds note
   if [[ "${STATUS[2]}" != PASS ]]; then rec 3 "$name" SKIP "no bucket"; return 0; fi
   calibrate_cli
+  if [[ "$CRASH_FAULT" == power ]]; then
+    if [[ "$IS_CIFS" != 1 || "$CRASH_OP" == start ]]; then
+      echo "CRASH_FAULT=power needs a cifs flavour and an object operation" >&2
+      exit 2
+    fi
+    # The format written at first start must not be part of what gets lost.
+    sudo sync -f "$EXPORT"
+  fi
   case "$CRASH_OP" in
     put)       crash_put ;;
     overwrite) crash_overwrite ;;
