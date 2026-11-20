@@ -45,7 +45,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: cifs-compat-check-${{ github.ref }}
+  group: cifs-compat-check-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 env:
