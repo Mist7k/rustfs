@@ -1,0 +1,235 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Fast Rust feedback for the cifs-compat branch on GitHub-hosted runners.
+# Upstream's ci.yml targets self-hosted runners that this fork does not have,
+# so this workflow reproduces the relevant upstream gates (format, package
+# scoped Clippy, ecstore nextest, and on demand the whole workspace suite)
+# with the same commands, flags and profiles.
+
+name: CIFS Compat Check
+
+on:
+  push:
+    branches: [ cifs-compat ]
+    paths:
+      - "crates/**"
+      - "rustfs/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/cifs-compat-check.yml"
+  workflow_dispatch:
+    inputs:
+      full_suite:
+        description: Also run the whole workspace test suite (mirrors upstream ci.yml)
+        type: boolean
+        default: false
+      test_filter:
+        description: Optional nextest filter expression or test name substring for the rustfs-ecstore tests (empty = whole crate)
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cifs-compat-check-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      # Only rustfmt is needed; no build, so no dependency cache.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  # Package-scoped variant of ci.yml "Workspace Lint and Build" / "Run clippy
+  # lints" (python3 scripts/ci_test_artifact.py cargo lint --configuration
+  # workspace == cargo clippy --locked --workspace --all-targets -- -D warnings,
+  # default features). The rustfs binary package is not linted separately: it is
+  # only linted upstream as part of that whole-workspace invocation, and
+  # compiling it pulls in most of the workspace, which is not cheap.
+  clippy-ecstore:
+    name: Clippy (rustfs-ecstore)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: cifs-compat-clippy
+          cache-save-if: "true"
+          install-build-packaging-tools: "false"
+
+      - name: Run clippy lints
+        run: cargo clippy --locked -p rustfs-ecstore --all-targets -- -D warnings
+
+  # Mirrors ci.yml "Workspace tests" / "Run nextest tests" (--profile ci), scoped
+  # to rustfs-ecstore. The crate sets `doctest = false` in its Cargo.toml, so the
+  # upstream doctest step has nothing to run here and is omitted.
+  test-ecstore:
+    name: Test (rustfs-ecstore)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: cifs-compat-test
+          cache-save-if: "true"
+          install-build-packaging-tools: "false"
+
+      # Same step as ci.yml: Connect tests refuse a group/world-writable home.
+      - name: Protect Connect test home
+        run: chmod go-w "$(realpath "$HOME")"
+
+      - name: Run nextest tests
+        env:
+          NEXTEST_HIDE_PROGRESS_BAR: "1"
+          TEST_FILTER: ${{ inputs.test_filter }}
+        run: |
+          args=()
+          if [[ -n "$TEST_FILTER" ]]; then
+            # Filterset expressions contain operators or function calls; a bare
+            # word is a plain test name substring.
+            if [[ "$TEST_FILTER" =~ [\(\)\&\|\!=~] ]]; then
+              args+=(-E "$TEST_FILTER")
+            else
+              args+=("$TEST_FILTER")
+            fi
+          fi
+          cargo nextest run --locked --profile ci -p rustfs-ecstore --no-tests fail \
+            --status-level all --final-status-level all "${args[@]}"
+
+  # Mirrors the whole-workspace test lane of ci.yml on a hosted runner, run as a
+  # single job like upstream's default (non-rehearsal) path:
+  #   - "Workspace Lint and Build" -> "Archive workspace test binaries"
+  #       python3 scripts/ci_test_artifact.py build --configuration workspace
+  #   - "Workspace Lint and Build" -> "Run documentation tests"
+  #       python3 scripts/ci_test_artifact.py cargo doc --configuration workspace
+  #   - "Workspace tests" -> "Verify workspace archive identity",
+  #       "Extract and list workspace tests", "Run nextest tests" (--profile ci),
+  #       "Verify workspace execution completeness"
+  #   - "Workspace tests" -> "Run ignored ILM integration tests serially"
+  # Not mirrored: workspace clippy (covered by clippy-ecstore for the lint
+  # gate here), the upload/download of the archive between two jobs (the archive
+  # is built and consumed inside this one job), the resource sampler and
+  # artifact uploads, the optional workspace-shards rehearsal (it needs a
+  # same-run shard plan and is not part of upstream's default path), and every
+  # downstream lane (e2e, core-contract, feature, FIPS, io_uring), which need
+  # the debug binary, privileged mounts or other infrastructure.
+  full-suite:
+    name: Full workspace suite
+    if: github.event_name == 'workflow_dispatch' && inputs.full_suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      # Same as upstream: workspace test compilation has high per-process memory use.
+      CARGO_BUILD_JOBS: "2"
+      # Hosted runners have far less disk than the self-hosted pool; omit debug
+      # info so the workspace test build fits.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      # The workspace test build needs far more disk than the default free
+      # space; remove preinstalled toolchains this job never uses.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: cifs-compat-full-suite
+          cache-save-if: "true"
+          install-build-packaging-tools: "false"
+
+      - name: Protect Connect test home
+        run: chmod go-w "$(realpath "$HOME")"
+
+      - name: Archive workspace test binaries
+        run: python3 scripts/ci_test_artifact.py build --configuration workspace --archive "$RUNNER_TEMP/workspace-tests.tar.zst"
+
+      - name: Run documentation tests
+        run: timeout --verbose --signal=TERM --kill-after=30s 40m python3 scripts/ci_test_artifact.py cargo doc --configuration workspace
+
+      - name: Verify workspace archive identity
+        run: python3 scripts/ci_test_artifact.py verify --configuration workspace --archive "$RUNNER_TEMP/workspace-tests.tar.zst"
+
+      - name: Extract and list workspace tests
+        run: |
+          mkdir -p artifacts/workspace
+          cargo nextest list --profile ci --archive-file "$RUNNER_TEMP/workspace-tests.tar.zst" --workspace-remap "$GITHUB_WORKSPACE" --extract-to "$GITHUB_WORKSPACE" --extract-overwrite --message-format json \
+            > artifacts/workspace/core-test-listing.json
+          python3 scripts/check_test_wiring.py --check-core artifacts/workspace/core-test-listing.json
+
+      - name: Run nextest tests
+        env:
+          NEXTEST_HIDE_PROGRESS_BAR: "1"
+        run: |
+          rm -f target/nextest/ci/junit.xml
+          timeout --verbose --signal=TERM --kill-after=30s 100m \
+            cargo nextest run --profile ci --cargo-metadata target/nextest/cargo-metadata.json --binaries-metadata target/nextest/binaries-metadata.json \
+            --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
+            --status-level all --final-status-level all
+
+      - name: Verify workspace execution completeness
+        run: |
+          python3 scripts/ci_test_artifact.py evidence artifacts/workspace/core-test-listing.json target/nextest/ci/junit.xml
+          ./scripts/check_migration_gate_count.sh evidence artifacts/workspace/core-test-listing.json target/nextest/ci/junit.xml
+
+      - name: Run ignored ILM integration tests serially
+        env:
+          NEXTEST_HIDE_PROGRESS_BAR: "1"
+        run: |
+          timeout --verbose --signal=TERM --kill-after=30s 80m \
+            cargo nextest run --profile default -j1 --run-ignored ignored-only \
+            --cargo-metadata target/nextest/cargo-metadata.json --binaries-metadata target/nextest/binaries-metadata.json \
+            --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
+            -E 'binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))' \
+            --status-level all --final-status-level all
