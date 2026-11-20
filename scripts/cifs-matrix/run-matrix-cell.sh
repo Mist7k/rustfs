@@ -30,7 +30,9 @@
 #                      /tmp/cifs-matrix for fs=external)
 #   CELL_DATA_DIR      data dir, required for fs=external
 #   CELL_PORT          rustfs listen port (default 9000)
-#   CELL_MODE          steps (default) | crash
+#   CELL_MODE          steps (default) | crash | upgrade
+#   UPGRADE_FROM_BIN   upgrade mode: older rustfs binary that writes the data
+#                      first; <rustfs-binary> then takes over the same data dir
 #   CRASH_OP           crash mode: put | overwrite | multipart | start
 #   CRASH_ITERATIONS   crash mode: rounds (default 100)
 #   CRASH_FAULT        crash mode: kill (default) | power
@@ -63,6 +65,8 @@ else
   WORK="${CELL_WORK_DIR:-/mnt/cifs-matrix}"
 fi
 EXTRA_ENV="${RUSTFS_EXTRA_ENV:-}"
+# Binary used by start_rustfs; upgrade mode switches it between the two.
+RUN_BIN="$BIN"
 
 PORT="${CELL_PORT:-9000}"
 ENDPOINT="http://127.0.0.1:${PORT}"
@@ -403,7 +407,7 @@ start_rustfs() {
     RUSTFS_OBS_LOGGER_LEVEL=info \
     RUSTFS_OBS_LOG_STDOUT_ENABLED=true \
     "${extra[@]}" \
-    "$BIN" >> "$LOG" 2>&1 &
+    "$RUN_BIN" >> "$LOG" 2>&1 &
   RUSTFS_PID=$!
 }
 
@@ -904,6 +908,80 @@ step_crash() {
   fi
 }
 
+# ---------------------------------------------------------- upgrade mode ----
+SHA_POST=""
+SHA_MP2=""
+
+# verify_set <key:sha>...: sets VERIFY_NOTE; 0 when every object matches.
+VERIFY_NOTE=""
+verify_set() {
+  local pair key
+  VERIFY_NOTE=""
+  for pair in "$@"; do
+    key="${pair%%:*}"
+    if ! get_matches "$key" "${pair#*:}"; then
+      VERIFY_NOTE="$key: ${AWS_ERR:-sha256 mismatch}"
+      return 1
+    fi
+    VERIFY_NOTE+="$key "
+  done
+}
+
+step_upgrade_takeover() {
+  local name="new binary: start + old objects intact"
+  if [[ "${STATUS[3]}" != PASS || "${STATUS[4]}" != PASS ]]; then
+    rec 5 "$name" SKIP "old binary did not write the data"; return 0
+  fi
+  stop_rustfs
+  RUN_BIN="$BIN"
+  start_rustfs "upgrade: new binary"
+  if ! wait_ready 120; then rec 5 "$name" FAIL "$READY_NOTE"; return 0; fi
+  if verify_set "simple:$SHA_SIMPLE" "keep:$SHA_KEEP" "mp:$SHA_MP"; then
+    rec 5 "$name" PASS "verified: $VERIFY_NOTE"
+  else
+    rec 5 "$name" FAIL "$VERIFY_NOTE"
+  fi
+}
+
+step_upgrade_write() {
+  local name="new binary: PUT + multipart + restart"
+  if [[ "${STATUS[5]}" != PASS ]]; then rec 6 "$name" SKIP "takeover failed"; return 0; fi
+  head -c 1048576 /dev/urandom > "$TMP/post.bin"
+  SHA_POST="$(sha "$TMP/post.bin")"
+  if ! s3api put-object --bucket "$BUCKET" --key post --body "$TMP/post.bin" >/dev/null; then
+    rec 6 "$name" FAIL "put post: $AWS_ERR"; return 0
+  fi
+  if ! mp_prepare mp2; then rec 6 "$name" FAIL "upload parts"; return 0; fi
+  SHA_MP2="$MP_SHA"
+  if ! s3api complete-multipart-upload --bucket "$BUCKET" --key mp2 --upload-id "$MP_UID" \
+      --multipart-upload "file://$TMP/cparts.json" >/dev/null; then
+    rec 6 "$name" FAIL "complete-multipart-upload: $AWS_ERR"; return 0
+  fi
+  stop_rustfs
+  start_rustfs "upgrade: new binary restart"
+  if ! wait_ready 120; then rec 6 "$name" FAIL "after restart: $READY_NOTE"; return 0; fi
+  if verify_set "simple:$SHA_SIMPLE" "keep:$SHA_KEEP" "mp:$SHA_MP" "post:$SHA_POST" "mp2:$SHA_MP2"; then
+    rec 6 "$name" PASS "verified: $VERIFY_NOTE"
+  else
+    rec 6 "$name" FAIL "$VERIFY_NOTE"
+  fi
+}
+
+# Can the old binary take the data dir back after the new one wrote to it?
+step_upgrade_rollback() {
+  local name="rollback: old binary start + all objects intact"
+  if [[ "${STATUS[6]}" != PASS ]]; then rec 7 "$name" SKIP "new binary did not write"; return 0; fi
+  stop_rustfs
+  RUN_BIN="$UPGRADE_FROM"
+  start_rustfs "upgrade: back to old binary"
+  if ! wait_ready 120; then rec 7 "$name" FAIL "$READY_NOTE"; return 0; fi
+  if verify_set "simple:$SHA_SIMPLE" "keep:$SHA_KEEP" "mp:$SHA_MP" "post:$SHA_POST" "mp2:$SHA_MP2"; then
+    rec 7 "$name" PASS "verified: $VERIFY_NOTE"
+  else
+    rec 7 "$name" FAIL "$VERIFY_NOTE"
+  fi
+}
+
 # ------------------------------------------------------------------ main ----
 log "binary: $BIN"
 "$BIN" --version 2>&1 | head -3 > "$OUT_DIR/version.txt" || true
@@ -917,6 +995,17 @@ if [[ "${CELL_MODE:-steps}" == crash ]]; then
   step_start
   step_bucket
   step_crash
+elif [[ "${CELL_MODE:-steps}" == upgrade ]]; then
+  UPGRADE_FROM="$(readlink -f "${UPGRADE_FROM_BIN:?upgrade mode needs UPGRADE_FROM_BIN}")"
+  [[ -x "$UPGRADE_FROM" ]] || { echo "UPGRADE_FROM_BIN not executable" >&2; exit 2; }
+  RUN_BIN="$UPGRADE_FROM"
+  step_start
+  step_bucket
+  step_simple
+  step_multipart
+  step_upgrade_takeover
+  step_upgrade_write
+  step_upgrade_rollback
 else
   step_start
   step_bucket

@@ -31,6 +31,11 @@
 #   PROBE_LOCAL_BIN    rustfs binary on the container-local disk (optional)
 #   PROBE_LOCAL_CELLS  whitespace separated "label:KEY=VALUE" cells run with
 #                      PROBE_LOCAL_BIN, e.g. "branch-content:RUSTFS_FS_IDENTITY_MODE=content"
+#   PROBE_UPGRADE_FROM_TAG  release tag from RUSTFS_TAGS; adds one
+#                      "upgrade-<label>" cell per PROBE_LOCAL_CELLS entry: that
+#                      release writes the data, PROBE_LOCAL_BIN takes it over
+#   PROBE_SKIP_RELEASE_CELLS  set to 1 to download the releases but not run
+#                      their plain cells
 #
 # Exit codes: 0 probe ran (step FAILs are data), 3 precondition failed,
 #             4 tooling/download failed.
@@ -41,6 +46,7 @@ SB_ROOT="${SB_ROOT:-/sb}"
 RUSTFS_TAGS="${RUSTFS_TAGS-1.0.0-beta.8 1.0.2 1.0.6}"
 PROBE_LOCAL_BIN="${PROBE_LOCAL_BIN:-}"
 PROBE_LOCAL_CELLS="${PROBE_LOCAL_CELLS:-}"
+PROBE_UPGRADE_FROM_TAG="${PROBE_UPGRADE_FROM_TAG:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_ROOT="/tmp/rustfs-bin"
 DL_DIR="/tmp/rustfs-dl"
@@ -215,12 +221,13 @@ done
 # ------------------------------------------------------------------ cells ----
 CELLS=""
 
-# run_cell <label> <binary> [extra rustfs env]
+# run_cell <label> <binary> [extra rustfs env] [older binary for upgrade mode]
 run_cell() {
-  local label="$1" bin="$2" extra="${3:-}" out="$OUT_ROOT/$1"
+  local label="$1" bin="$2" extra="${3:-}" from="${4:-}" out="$OUT_ROOT/$1"
   rm -rf -- "$out"
   mkdir "$T/$label"
   echo "=== cell $label ==="
+  CELL_MODE="${from:+upgrade}" UPGRADE_FROM_BIN="$from" \
   CELL_DATA_DIR="$T/$label" RUSTFS_EXTRA_ENV="$extra" timeout 900 \
     bash "$SCRIPT_DIR/run-matrix-cell.sh" "$label" external "$bin" "$out" &
   CELL_PID=$!
@@ -232,27 +239,35 @@ run_cell() {
   if [[ -f "$out/rustfs.log" ]]; then
     { grep -E "$SIG_RE" "$out/rustfs.log" | head -n 15 | cut -c1-700; } || true
   fi
-  [[ -f "$out/steps.tsv" ]] && tail -n 5 "$out/steps.tsv" || true
+  [[ -f "$out/steps.tsv" ]] && tail -n 7 "$out/steps.tsv" || true
 }
 
-for tag in $DL_OK; do
-  run_cell "release-$tag" "$BIN_ROOT/$tag/rustfs"
-done
+if [[ "${PROBE_SKIP_RELEASE_CELLS:-0}" != 1 ]]; then
+  for tag in $DL_OK; do
+    run_cell "release-$tag" "$BIN_ROOT/$tag/rustfs"
+  done
+fi
 
 # Optional cells for a binary the caller placed on the container-local disk.
 if [[ -n "$PROBE_LOCAL_BIN" ]]; then
   for cell in $PROBE_LOCAL_CELLS; do
     run_cell "${cell%%:*}" "$PROBE_LOCAL_BIN" "${cell#*:}"
   done
+  if [[ -n "$PROBE_UPGRADE_FROM_TAG" ]]; then
+    [[ -x "$BIN_ROOT/$PROBE_UPGRADE_FROM_TAG/rustfs" ]] || die 4 "upgrade source $PROBE_UPGRADE_FROM_TAG was not downloaded"
+    for cell in $PROBE_LOCAL_CELLS; do
+      run_cell "upgrade-${cell%%:*}" "$PROBE_LOCAL_BIN" "${cell#*:}" "$BIN_ROOT/$PROBE_UPGRADE_FROM_TAG/rustfs"
+    done
+  fi
 fi
 
 # ---------------------------------------------------------------- summary ----
 echo "=== SUMMARY ==="
-printf '%-24s %s\n' cell "s1   s2   s3   s4   s5   s6"
+printf '%-24s %s\n' cell "s1   s2   s3   s4   s5   s6   s7"
 for label in $CELLS; do
   f="$OUT_ROOT/$label/steps.tsv"
   line=""
-  for id in 1 2 3 4 5 6; do
+  for id in 1 2 3 4 5 6 7; do
     st="-"
     if [[ -f "$f" ]]; then
       st="$(awk -F'\t' -v i="$id" '$1 == i {print $3; exit}' "$f")"

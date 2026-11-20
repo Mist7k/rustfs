@@ -1,0 +1,121 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Compares the branch binary with one older upstream release on the same
+# filesystem: an in-place upgrade of a data dir written by that release, and
+# the crash loop for both binaries. The branch binary comes from the newest
+# "CIFS Matrix" run of this branch that still has its build artifact.
+
+name: CIFS Baseline
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ cifs-compat ]
+    paths:
+      - .github/workflows/cifs-baseline.yml
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: cifs-baseline-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BASELINE_TAG: 1.0.0-beta.8
+
+jobs:
+  upgrade:
+    name: upgrade / ${{ matrix.cell.identity }} / ${{ matrix.cell.fs }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        cell:
+          - { identity: content, fs: cifs-noserverino-strict }
+          - { identity: content, fs: local }
+          - { identity: inode, fs: local }
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+
+      - name: Download binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/cifs-matrix/fetch-baseline-binaries.sh
+
+      - name: Run upgrade cell
+        env:
+          TARGET: upgrade-${{ matrix.cell.identity }}
+          FS: ${{ matrix.cell.fs }}
+          CELL_MODE: upgrade
+          RUSTFS_EXTRA_ENV: RUSTFS_FS_IDENTITY_MODE=${{ matrix.cell.identity }} RUSTFS_ISSUE3031_DIAG_ENABLE=true
+        run: |
+          UPGRADE_FROM_BIN="$RUNNER_TEMP/rustfs-old/rustfs" \
+          bash scripts/cifs-matrix/run-matrix-cell.sh \
+            "$TARGET" "$FS" "$RUNNER_TEMP/rustfs-bin/rustfs" \
+            "$GITHUB_WORKSPACE/cifs-baseline-out"
+
+      - name: Upload cell results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cifs-baseline-upgrade-${{ matrix.cell.identity }}-${{ matrix.cell.fs }}
+          path: cifs-baseline-out
+          if-no-files-found: warn
+          retention-days: 14
+
+  crash:
+    name: ${{ matrix.bin }} / ${{ matrix.fault }} / ${{ matrix.op }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        bin: [ baseline, branch-content ]
+        fault: [ kill, power ]
+        op: [ put, overwrite, multipart ]
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+
+      - name: Download binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/cifs-matrix/fetch-baseline-binaries.sh
+
+      - name: Run crash cell
+        env:
+          TARGET: ${{ matrix.bin }}-${{ matrix.fault }}-${{ matrix.op }}
+          CELL_MODE: crash
+          CRASH_OP: ${{ matrix.op }}
+          CRASH_FAULT: ${{ matrix.fault }}
+          CRASH_ITERATIONS: "100"
+          RUSTFS_EXTRA_ENV: RUSTFS_FS_IDENTITY_MODE=content RUSTFS_ISSUE3031_DIAG_ENABLE=true
+        run: |
+          bin="$RUNNER_TEMP/rustfs-bin/rustfs"
+          if [[ "${{ matrix.bin }}" == baseline ]]; then bin="$RUNNER_TEMP/rustfs-old/rustfs"; fi
+          bash scripts/cifs-matrix/run-matrix-cell.sh \
+            "$TARGET" cifs-noserverino-strict "$bin" \
+            "$GITHUB_WORKSPACE/cifs-baseline-out"
+
+      - name: Upload cell results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cifs-baseline-${{ matrix.bin }}-${{ matrix.fault }}-${{ matrix.op }}
+          path: cifs-baseline-out
+          if-no-files-found: warn
+          retention-days: 14
