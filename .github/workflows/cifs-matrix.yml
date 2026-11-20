@@ -128,15 +128,16 @@ jobs:
           retention-days: 14
 
   branch-matrix:
-    name: ${{ matrix.target }} / ${{ matrix.fs }}
+    name: branch-${{ matrix.identity }} / ${{ matrix.fs }}
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - branch
+        identity:
+          - inode
+          - content
         fs:
           - local
           - cifs-noserverino
@@ -153,11 +154,9 @@ jobs:
 
       - name: Run matrix cell
         env:
-          TARGET: ${{ matrix.target }}
+          TARGET: branch-${{ matrix.identity }}
           FS: ${{ matrix.fs }}
-          # Extra rustfs environment for later experiments, e.g.
-          # "RUSTFS_FS_IDENTITY_MODE=...". Whitespace separated KEY=VALUE.
-          RUSTFS_EXTRA_ENV: ""
+          RUSTFS_EXTRA_ENV: RUSTFS_FS_IDENTITY_MODE=${{ matrix.identity }}
         run: |
           chmod +x "$RUNNER_TEMP/rustfs-bin/rustfs"
           bash scripts/cifs-matrix/run-matrix-cell.sh \
@@ -168,7 +167,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: cifs-result-${{ matrix.target }}-${{ matrix.fs }}
+          name: cifs-result-branch-${{ matrix.identity }}-${{ matrix.fs }}
           path: cifs-matrix-out
           if-no-files-found: warn
           retention-days: 14
