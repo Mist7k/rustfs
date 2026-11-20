@@ -182,7 +182,16 @@ SMBCONF
 
   local opts="username=$SMB_USER,password=$SMB_PASS,vers=3.1.1,$CACHE_OPT,soft,nounix,mapposix,nobrl,mfsymlinks,noperm,uid=$(id -u),gid=$(id -g),$SERVERINO_OPT"
   log "mounting //127.0.0.1/data on $MNT"
-  sudo mount -t cifs //127.0.0.1/data "$MNT" -o "$opts"
+  # The published port accepts connections before smbd is listening inside
+  # the container, so the first mount attempts can be reset.
+  for i in $(seq 1 30); do
+    if sudo mount -t cifs //127.0.0.1/data "$MNT" -o "$opts"; then return 0; fi
+    sleep 1
+  done
+  docker logs "$CONTAINER" 2>&1 | tail -50 || true
+  sudo dmesg 2>/dev/null | grep -i cifs | tail -30 || true
+  echo "cifs mount failed" >&2
+  return 1
 }
 
 prepare_fs() {
