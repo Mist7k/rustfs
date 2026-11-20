@@ -25,6 +25,7 @@ on:
     branches: [ cifs-compat ]
     paths:
       - .github/workflows/cifs-baseline.yml
+      - scripts/cifs-matrix/fetch-baseline-binaries.sh
 
 permissions:
   contents: read
