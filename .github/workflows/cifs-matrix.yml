@@ -1,0 +1,151 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Reproduces RustFS behaviour on a CIFS/SMB mount (Samba in a container on the
+# runner, kernel CIFS client mounted on the host) next to a local-disk control.
+# Each matrix cell runs one rustfs binary on one filesystem flavour and reports
+# per-step PASS/FAIL/SKIP honestly; no failure is inverted or tolerated.
+
+name: CIFS Matrix
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ cifs-compat ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cifs-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build rustfs (release)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          cache-shared-key: cifs-matrix-build
+          cache-save-if: "true"
+          install-build-packaging-tools: "false"
+          install-test-tools: "false"
+
+      - name: Build rustfs
+        run: cargo build --release --locked -p rustfs --bin rustfs
+
+      - name: Show binary
+        run: |
+          ls -l target/release/rustfs
+          target/release/rustfs --version || true
+
+      - name: Upload binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rustfs-branch-binary
+          path: target/release/rustfs
+          if-no-files-found: error
+          retention-days: 7
+
+  cifs-matrix:
+    name: ${{ matrix.target }} / ${{ matrix.fs }}
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - release-1.0.0-beta.8
+          - release-1.0.2
+          - release-1.0.6
+          - branch
+        fs:
+          - local
+          - cifs-noserverino
+          - cifs-serverino
+          - cifs-noserverino-strict
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+
+      - name: Download branch binary
+        if: matrix.target == 'branch'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: rustfs-branch-binary
+          path: ${{ runner.temp }}/rustfs-bin
+
+      - name: Download upstream release binary
+        if: startsWith(matrix.target, 'release-')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          tag="${TARGET#release-}"
+          asset="rustfs-linux-x86_64-gnu-v${tag}.zip"
+          mkdir -p "$RUNNER_TEMP/rustfs-dl" "$RUNNER_TEMP/rustfs-bin"
+          gh release download "$tag" --repo rustfs/rustfs --pattern "$asset" --dir "$RUNNER_TEMP/rustfs-dl"
+          unzip -o "$RUNNER_TEMP/rustfs-dl/$asset" -d "$RUNNER_TEMP/rustfs-dl/x"
+          bin="$(find "$RUNNER_TEMP/rustfs-dl/x" -type f -name rustfs | head -n1)"
+          test -n "$bin"
+          cp "$bin" "$RUNNER_TEMP/rustfs-bin/rustfs"
+
+      - name: Run matrix cell
+        env:
+          TARGET: ${{ matrix.target }}
+          FS: ${{ matrix.fs }}
+          # Extra rustfs environment for later experiments, e.g.
+          # "RUSTFS_FS_IDENTITY_MODE=...". Whitespace separated KEY=VALUE.
+          RUSTFS_EXTRA_ENV: ""
+        run: |
+          chmod +x "$RUNNER_TEMP/rustfs-bin/rustfs"
+          bash scripts/cifs-matrix/run-matrix-cell.sh \
+            "$TARGET" "$FS" "$RUNNER_TEMP/rustfs-bin/rustfs" \
+            "$GITHUB_WORKSPACE/cifs-matrix-out"
+
+      - name: Upload cell results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cifs-result-${{ matrix.target }}-${{ matrix.fs }}
+          path: cifs-matrix-out
+          if-no-files-found: warn
+          retention-days: 14
+
+  summary:
+    name: Combined summary
+    if: always()
+    needs: cifs-matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+
+      - name: Download all cell results
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: cifs-result-*
+          path: ${{ runner.temp }}/cifs-results
+
+      - name: Combined table
+        run: python3 -I scripts/cifs-matrix/combine-results.py "$RUNNER_TEMP/cifs-results"
