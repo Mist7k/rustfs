@@ -47,9 +47,9 @@ use super::super::{
     RUSTFS_META_MULTIPART_BUCKET, RawFileInfo, ReadMultipleReq, ReadMultipleResp, Result, SLASH_SEPARATOR, STORAGE_FORMAT_FILE,
     SetDisks, SnapshotLeaseToken, StorageError, UpdateMetadataOpts, Uuid, capacity_scope_from_disks, current_dirty_generation,
     debug, disk, file_info_is_valid_for_metadata, info, is_object_dangling, issue3031_diag_enabled, join_all, join_errs,
-    log_multipart_write_quorum_failure, merge_file_meta_versions, path_join_buf, record_global_dirty_scope,
-    reduce_read_quorum_errs, reduce_write_quorum_errs, send_heal_request_with_admission, should_prevent_write, to_object_err,
-    warn,
+    log_multipart_part_commit_settle_failure, log_multipart_part_commit_unconfirmed, log_multipart_write_quorum_failure,
+    merge_file_meta_versions, path_join_buf, record_global_dirty_scope, reduce_read_quorum_errs, reduce_write_quorum_errs,
+    send_heal_request_with_admission, should_prevent_write, to_object_err, warn,
 };
 #[cfg(test)]
 use super::super::{ReadOptions, coding};
@@ -5768,6 +5768,8 @@ impl SetDisks {
             .iter()
             .zip(prepared_disks.iter())
             .all(|(err, disk)| err.is_none() && disk.as_ref().is_some_and(|d| d.is_local()));
+        // Per-disk view of the commit phase: the rename errors plus any settle failure.
+        let mut commit_errs = errs.clone();
         let committed = if all_prepared_succeeded {
             let settles = prepared_disks.iter().map(|disk| {
                 let disk = disk.clone();
@@ -5781,6 +5783,16 @@ impl SetDisks {
                 }
             });
             let settle_results = join_all(settles).await;
+            for (index, result) in settle_results.iter().enumerate() {
+                if let Err(settle_err) = result {
+                    log_multipart_part_commit_settle_failure(quorum_context, &dst_object, index, settle_err);
+                    if let Some(slot) = commit_errs.get_mut(index)
+                        && slot.is_none()
+                    {
+                        *slot = Some(settle_err.clone());
+                    }
+                }
+            }
             if settle_results.iter().filter(|res| res.is_ok()).count() >= write_quorum
                 && settle_results
                     .iter()
@@ -5795,11 +5807,18 @@ impl SetDisks {
             self.recover_part_transaction(&dst_object, write_quorum).await?
         };
         if !committed {
+            // No disk reported a failure, so this is not a write-quorum loss: the commit simply
+            // could not be confirmed. Report that instead of a quorum error with zero failures.
+            if commit_errs.iter().all(Option::is_none) {
+                let err = DiskError::other("multipart part transaction commit could not be confirmed on any disk");
+                log_multipart_part_commit_unconfirmed(quorum_context, &dst_object, &commit_errs, write_quorum, &err);
+                return Err(err);
+            }
             let err = DiskError::ErasureWriteQuorum;
             if let Some(context) = quorum_context {
-                log_multipart_write_quorum_failure(context, &errs, write_quorum, &err);
+                log_multipart_write_quorum_failure(context, &commit_errs, write_quorum, &err);
             } else {
-                warn!("rename_part errs {:?}", &errs);
+                warn!("rename_part errs {:?}", &commit_errs);
             }
             return Err(err);
         }

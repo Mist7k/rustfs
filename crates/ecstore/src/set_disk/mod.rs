@@ -4309,6 +4309,93 @@ fn log_multipart_write_quorum_failure(
     );
 }
 
+fn log_multipart_part_commit_settle_failure(
+    context: Option<MultipartWriteQuorumContext<'_>>,
+    dst_object: &str,
+    disk_index: usize,
+    error: &DiskError,
+) {
+    match context {
+        Some(context) => warn!(
+            target: "rustfs_ecstore::set_disk",
+            event = EVENT_SET_DISK_MULTIPART,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_SET_DISK,
+            op = "upload_part",
+            state = "part_commit_settle_failed",
+            stage = context.stage,
+            bucket = %context.bucket,
+            object = %context.object,
+            upload_id = %context.upload_id,
+            part_number = context.part_number,
+            disk_index = disk_index,
+            error = %error,
+            "Set disk multipart part commit settle failed"
+        ),
+        None => warn!(
+            target: "rustfs_ecstore::set_disk",
+            event = EVENT_SET_DISK_MULTIPART,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_SET_DISK,
+            op = "upload_part",
+            state = "part_commit_settle_failed",
+            path = %dst_object,
+            disk_index = disk_index,
+            error = %error,
+            "Set disk multipart part commit settle failed"
+        ),
+    }
+}
+
+/// Logged when no disk reported a failure yet the
+/// part transaction commit could not be confirmed. This is not a write-quorum
+/// loss, so it must not be reported as one.
+fn log_multipart_part_commit_unconfirmed(
+    context: Option<MultipartWriteQuorumContext<'_>>,
+    dst_object: &str,
+    errs: &[Option<DiskError>],
+    write_quorum: usize,
+    returned_error: &DiskError,
+) {
+    let summary = build_write_quorum_failure_summary(errs, OBJECT_OP_IGNORED_ERRS, write_quorum);
+    match context {
+        Some(context) => warn!(
+            target: "rustfs_ecstore::set_disk",
+            event = EVENT_SET_DISK_MULTIPART,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_SET_DISK,
+            op = "upload_part",
+            state = "part_commit_unconfirmed",
+            stage = context.stage,
+            bucket = %context.bucket,
+            object = %context.object,
+            upload_id = %context.upload_id,
+            part_number = context.part_number,
+            required = summary.required,
+            achieved = summary.achieved,
+            failed = summary.failed,
+            total = summary.total,
+            returned_error = %returned_error,
+            "Set disk multipart part commit unconfirmed"
+        ),
+        None => warn!(
+            target: "rustfs_ecstore::set_disk",
+            event = EVENT_SET_DISK_MULTIPART,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_SET_DISK,
+            op = "upload_part",
+            state = "part_commit_unconfirmed",
+            path = %dst_object,
+            required = summary.required,
+            achieved = summary.achieved,
+            failed = summary.failed,
+            total = summary.total,
+            returned_error = %returned_error,
+            "Set disk multipart part commit unconfirmed"
+        ),
+    }
+}
+
 fn issue3031_diag_enabled() -> bool {
     rustfs_utils::get_env_bool(ENV_ISSUE3031_DIAG_ENABLE, false)
 }

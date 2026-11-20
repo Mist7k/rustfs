@@ -433,4 +433,37 @@ mod tests {
         assert_eq!(count, 2);
         assert_eq!(err, None); // None means Error::Nil is preferred
     }
+
+    #[test]
+    fn test_write_quorum_met_without_failures_never_reduces_to_quorum_error() {
+        // `rename_part` relies on this: a vector with quorum of successes and no
+        // failure must not be reported as a write-quorum loss.
+        for (len, quorum) in [(1, 1), (4, 3), (4, 4), (5, 3)] {
+            let errors = vec![None; len];
+            assert_eq!(reduce_write_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, quorum), None);
+            let summary = build_write_quorum_failure_summary(&errors, OBJECT_OP_IGNORED_ERRS, quorum);
+            assert!(summary.achieved >= summary.required && summary.failed == 0);
+            assert_eq!(summary.dominant_error_label, "nil_dominated");
+        }
+    }
+
+    #[test]
+    fn test_write_quorum_reduction_below_quorum_stays_quorum_error() {
+        let errors = [None, None, Some(err_io("a")), Some(err_io("b"))];
+        assert_eq!(
+            reduce_write_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, 3),
+            Some(Error::ErasureWriteQuorum)
+        );
+        let errors = [None, Some(Error::DiskNotFound), Some(Error::DiskNotFound), Some(Error::DiskNotFound)];
+        assert_eq!(
+            reduce_write_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, 2),
+            Some(Error::ErasureWriteQuorum)
+        );
+    }
+
+    #[test]
+    fn test_write_quorum_reduction_ignores_ignored_errors_when_quorum_of_successes() {
+        let errors = [None, None, None, Some(Error::DiskNotFound)];
+        assert_eq!(reduce_write_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, 3), None);
+    }
 }
