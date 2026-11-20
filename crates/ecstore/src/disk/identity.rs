@@ -32,7 +32,7 @@ use rustfs_config::{
 #[cfg(unix)]
 use std::io;
 use std::sync::OnceLock;
-use tracing::{error, warn};
+use tracing::warn;
 
 use super::{LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_DISK};
 
@@ -71,7 +71,7 @@ pub(crate) fn identity_mode() -> IdentityMode {
         let mode = match parse_identity_mode(raw.as_deref()) {
             Ok(mode) => mode,
             Err(err) => {
-                error!(
+                warn!(
                     event = EVENT_DISK_IDENTITY_MODE_INVALID,
                     component = LOG_COMPONENT_ECSTORE,
                     subsystem = LOG_SUBSYSTEM_DISK,
