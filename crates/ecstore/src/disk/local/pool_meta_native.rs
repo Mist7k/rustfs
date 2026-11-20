@@ -1447,6 +1447,45 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pool_meta_native_content_mode_backup_releases_the_predecessor_before_the_rename() {
+        let open_on_source = |source: &std::path::Path| {
+            std::fs::read_dir("/proc/self/fd")
+                .expect("descriptor table")
+                .filter_map(Result::ok)
+                .filter(|entry| std::fs::read_link(entry.path()).is_ok_and(|target| target == source))
+                .count()
+        };
+        let (_dir, root, base, source, backup_path) = content_mode_backup_fixture();
+        let canonical = source.canonicalize().expect("canonical source path");
+        let open_on_source = |_: &std::path::Path| open_on_source(&canonical);
+        let pinned = os::prepare_pool_meta_owned_backup_with_mode(
+            &source,
+            &base.join(OBJECT).join(Uuid::new_v4().to_string()).join(STORAGE_FORMAT_FILE_BACKUP),
+            &base,
+            &root,
+            b"predecessor",
+            false,
+            crate::disk::identity::IdentityMode::Inode,
+        )
+        .expect("inode mode backup");
+        assert_eq!(open_on_source(&source), 1, "inode mode pins the predecessor");
+        drop(pinned);
+
+        let prepared =
+            prepare_content_mode_backup(&source, &backup_path, &base, &root, b"predecessor").expect("content mode backup");
+        assert_eq!(open_on_source(&source), 0, "content mode must not keep the predecessor open");
+        prepared.verify_paths(&base, &root).expect("unchanged publication");
+        assert_eq!(open_on_source(&source), 0, "verification must not leave the predecessor open");
+
+        let staged = source.with_file_name("staged");
+        std::fs::write(&staged, b"successor!!").expect("staged successor");
+        std::fs::rename(&staged, &source).expect("commit rename");
+        assert!(prepared.verify_paths(&base, &root).is_err(), "the successor is not the predecessor");
+        assert_eq!(std::fs::read(&backup_path).expect("backup bytes"), b"predecessor");
+    }
+
     #[tokio::test]
     async fn pool_meta_native_fresh_undo_removes_only_its_matching_initial_write() {
         for batch in [false, true] {

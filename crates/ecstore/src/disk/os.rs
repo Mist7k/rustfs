@@ -4011,10 +4011,42 @@ pub(crate) struct PreparedPoolMetaBackup {
     source_path: PathBuf,
     file: std::fs::File,
     directory: std::fs::File,
-    source: std::fs::File,
+    source: PoolMetaBackupSource,
     linked: bool,
     mode: super::identity::IdentityMode,
     _ancestors: (ExistingBaseDirectoryGuard, ExistingBaseDirectoryGuard),
+}
+
+/// How a prepared backup remembers the predecessor it was taken from.
+#[cfg(unix)]
+enum PoolMetaBackupSource {
+    /// The predecessor stays open, so its inode cannot be recycled.
+    Pinned(std::fs::File),
+    /// `content` mode: some SMB servers refuse to rename over a file that is still open, so the
+    /// descriptor is released and the predecessor is recognized by length and SHA-256 instead.
+    Released { length: u64, sha256: [u8; 32] },
+}
+
+#[cfg(unix)]
+impl PoolMetaBackupSource {
+    fn pinned(&self) -> Option<&std::fs::File> {
+        match self {
+            Self::Pinned(file) => Some(file),
+            Self::Released { .. } => None,
+        }
+    }
+
+    fn matches_released(&self, current: &std::fs::File, backup: &std::fs::File) -> io::Result<bool> {
+        use std::os::unix::fs::MetadataExt;
+        let Self::Released { length, sha256 } = self else {
+            return Ok(false);
+        };
+        let metadata = current.metadata()?;
+        Ok(metadata.is_file()
+            && metadata.dev() == backup.metadata()?.dev()
+            && metadata.len() == *length
+            && super::identity::sha256_at(current, *length)? == *sha256)
+    }
 }
 
 #[cfg(not(unix))]
@@ -4036,8 +4068,10 @@ impl PreparedPoolMetaBackup {
 
     pub(crate) fn can_reuse_durability(&self, receipt: &DurableFileReceipt, root: &PublicationRoot, expected: &[u8]) -> bool {
         self.linked
-            && receipt.matches_source(root, &self.source, expected)
-            && super::identity::durability_proof_transfers(&self.source, &self.file, self.mode).unwrap_or(false)
+            && self.source.pinned().is_some_and(|source| {
+                receipt.matches_source(root, source, expected)
+                    && super::identity::durability_proof_transfers(source, &self.file, self.mode).unwrap_or(false)
+            })
     }
 
     pub(crate) fn sync_directory(&self) -> io::Result<()> {
@@ -4049,7 +4083,7 @@ impl PreparedPoolMetaBackup {
 
     pub(crate) fn verify_paths(&self, base: &Path, publication_root: &PublicationRoot) -> io::Result<()> {
         use rustix::fs::{Mode, OFlags, openat};
-        for (path, expected) in [(&self.source_path, &self.source), (&self.path, &self.file)] {
+        for (path, expected) in [(&self.source_path, self.source.pinned()), (&self.path, Some(&self.file))] {
             let parents = open_existing_directory_below_base_std(
                 path.parent().ok_or_else(|| io::Error::other("metadata has no parent"))?,
                 base,
@@ -4065,7 +4099,11 @@ impl PreparedPoolMetaBackup {
                 OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
             )?);
-            if !super::identity::same_file_handle(&current, expected, self.mode)? {
+            let unchanged = match expected {
+                Some(expected) => super::identity::same_file_handle(&current, expected, self.mode)?,
+                None => self.source.matches_released(&current, &self.file)?,
+            };
+            if !unchanged {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "pool metadata backup publication changed"));
             }
         }
@@ -4236,12 +4274,22 @@ pub(crate) fn prepare_pool_meta_owned_backup_with_mode(
         file
     };
     let directory = std::fs::File::from(backup_directory.try_clone()?);
+    let source = if mode == super::identity::IdentityMode::Content {
+        use sha2::{Digest, Sha256};
+        drop(old);
+        PoolMetaBackupSource::Released {
+            length: expected_length,
+            sha256: <[u8; 32]>::from(Sha256::digest(expected)),
+        }
+    } else {
+        PoolMetaBackupSource::Pinned(old)
+    };
     Ok(PreparedPoolMetaBackup {
         path: backup.to_path_buf(),
         source_path: source.to_path_buf(),
         file,
         directory,
-        source: old,
+        source,
         linked,
         mode,
         _ancestors: (source_guards, backup_guards),
