@@ -1353,6 +1353,100 @@ mod tests {
         assert_eq!(fs::read(&source).await.expect("retained current bytes"), b"different");
     }
 
+    #[cfg(unix)]
+    fn content_mode_backup_fixture() -> (
+        tempfile::TempDir,
+        os::PublicationRoot,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let dir = tempfile::tempdir().expect("metadata root");
+        let root = os::PublicationRoot::new(dir.path()).expect("anchored metadata root");
+        let base = dir.path().join(RUSTFS_META_BUCKET);
+        let object = base.join(OBJECT);
+        std::fs::create_dir_all(&object).expect("object directory");
+        let source = object.join(STORAGE_FORMAT_FILE);
+        std::fs::write(&source, b"predecessor").expect("predecessor fixture");
+        let backup_path = object.join(Uuid::new_v4().to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
+        (dir, root, base, source, backup_path)
+    }
+
+    #[cfg(unix)]
+    fn prepare_content_mode_backup(
+        source: &std::path::Path,
+        backup: &std::path::Path,
+        base: &std::path::Path,
+        root: &os::PublicationRoot,
+        expected: &[u8],
+    ) -> std::io::Result<os::PreparedPoolMetaBackup> {
+        os::prepare_pool_meta_owned_backup_with_mode(
+            source,
+            backup,
+            base,
+            root,
+            expected,
+            false,
+            crate::disk::identity::IdentityMode::Content,
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pool_meta_native_content_mode_backup_is_an_exact_unlinked_copy() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (_dir, root, base, source, backup_path) = content_mode_backup_fixture();
+        let prepared = prepare_content_mode_backup(&source, &backup_path, &base, &root, b"predecessor")
+            .expect("content mode backup");
+        assert!(!prepared.is_linked());
+        assert_eq!(std::fs::read(&backup_path).expect("backup bytes"), b"predecessor");
+        let source_metadata = std::fs::metadata(&source).expect("source metadata");
+        let backup_metadata = std::fs::metadata(&backup_path).expect("backup metadata");
+        assert_eq!(backup_metadata.dev(), source_metadata.dev());
+        assert_ne!(backup_metadata.ino(), source_metadata.ino());
+        prepared.sync_data().expect("backup file durability");
+        prepared.verify_paths(&base, &root).expect("unchanged publication");
+        let receipt = os::DurableFileReceipt::capture(&root, &source, b"predecessor").expect("durable receipt candidate");
+        assert!(!prepared.can_reuse_durability(&receipt, &root, b"predecessor"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pool_meta_native_content_mode_backup_refuses_wrong_predecessor_and_existing_backup() {
+        let (_dir, root, base, source, backup_path) = content_mode_backup_fixture();
+        assert!(prepare_content_mode_backup(&source, &backup_path, &base, &root, b"wrong predecessor").is_err());
+        assert!(!backup_path.exists());
+        std::fs::create_dir_all(backup_path.parent().expect("backup parent")).expect("backup directory");
+        std::fs::write(&backup_path, b"foreign").expect("pre-existing backup");
+        assert!(prepare_content_mode_backup(&source, &backup_path, &base, &root, b"predecessor").is_err());
+        assert_eq!(std::fs::read(&backup_path).expect("foreign backup retained"), b"foreign");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pool_meta_native_content_mode_verify_paths_rejects_changed_and_redirected_paths() {
+        use std::os::unix::fs::symlink;
+
+        for replace_source in [true, false] {
+            let (dir, root, base, source, backup_path) = content_mode_backup_fixture();
+            let prepared = prepare_content_mode_backup(&source, &backup_path, &base, &root, b"predecessor")
+                .expect("content mode backup");
+            let target = if replace_source { &source } else { &backup_path };
+            let replacement = dir.path().join("replacement");
+
+            // Same length, different bytes: only the content comparison can tell.
+            std::fs::write(&replacement, b"predecessoR").expect("replacement fixture");
+            std::fs::rename(&replacement, target).expect("replace path");
+            assert!(prepared.verify_paths(&base, &root).is_err());
+
+            std::fs::remove_file(target).expect("remove replaced path");
+            let other = if replace_source { &backup_path } else { &source };
+            symlink(other, target).expect("redirect path to the other file");
+            assert!(prepared.verify_paths(&base, &root).is_err());
+        }
+    }
+
     #[tokio::test]
     async fn pool_meta_native_fresh_undo_removes_only_its_matching_initial_write() {
         for batch in [false, true] {

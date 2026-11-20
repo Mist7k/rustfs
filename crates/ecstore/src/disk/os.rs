@@ -4013,6 +4013,7 @@ pub(crate) struct PreparedPoolMetaBackup {
     directory: std::fs::File,
     source: std::fs::File,
     linked: bool,
+    mode: super::identity::IdentityMode,
     _ancestors: (ExistingBaseDirectoryGuard, ExistingBaseDirectoryGuard),
 }
 
@@ -4036,8 +4037,7 @@ impl PreparedPoolMetaBackup {
     pub(crate) fn can_reuse_durability(&self, receipt: &DurableFileReceipt, root: &PublicationRoot, expected: &[u8]) -> bool {
         self.linked
             && receipt.matches_source(root, &self.source, expected)
-            && super::identity::durability_proof_transfers(&self.source, &self.file, super::identity::identity_mode())
-                .unwrap_or(false)
+            && super::identity::durability_proof_transfers(&self.source, &self.file, self.mode).unwrap_or(false)
     }
 
     pub(crate) fn sync_directory(&self) -> io::Result<()> {
@@ -4065,7 +4065,7 @@ impl PreparedPoolMetaBackup {
                 OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
             )?);
-            if !super::identity::same_file_handle(&current, expected, super::identity::identity_mode())? {
+            if !super::identity::same_file_handle(&current, expected, self.mode)? {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "pool metadata backup publication changed"));
             }
         }
@@ -4142,10 +4142,32 @@ pub(crate) fn prepare_pool_meta_owned_backup(
     expected: &[u8],
     force_copy: bool,
 ) -> io::Result<PreparedPoolMetaBackup> {
+    prepare_pool_meta_owned_backup_with_mode(
+        source,
+        backup,
+        base,
+        publication_root,
+        expected,
+        force_copy,
+        super::identity::identity_mode(),
+    )
+}
+
+/// In `content` mode the backup is always a fresh exclusive copy of `expected`,
+/// read back and compared before it is relied upon.
+#[cfg(unix)]
+pub(crate) fn prepare_pool_meta_owned_backup_with_mode(
+    source: &Path,
+    backup: &Path,
+    base: &Path,
+    publication_root: &PublicationRoot,
+    expected: &[u8],
+    force_copy: bool,
+    mode: super::identity::IdentityMode,
+) -> io::Result<PreparedPoolMetaBackup> {
     use rustix::fs::{AtFlags, Mode, OFlags, linkat, openat, unlinkat};
     use std::os::unix::fs::MetadataExt;
 
-    let mode = super::identity::identity_mode();
     let force_copy = force_copy || super::identity::prefer_copy_over_hardlink(mode);
     let source_parent = source.parent().ok_or_else(|| io::Error::other("source has no parent"))?;
     let backup_parent = backup.parent().ok_or_else(|| io::Error::other("backup has no parent"))?;
@@ -4185,13 +4207,26 @@ pub(crate) fn prepare_pool_meta_owned_backup(
         }
         file
     } else {
+        // Content mode reads the copy back, so its descriptor must be readable.
+        let access = if mode == super::identity::IdentityMode::Content {
+            OFlags::RDWR
+        } else {
+            OFlags::WRONLY
+        };
         let mut file = std::fs::File::from(openat(
             backup_directory,
             backup_name,
-            OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            OFlags::CREATE | OFlags::EXCL | access | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::from_raw_mode(0o666),
         )?);
-        if let Err(error) = std::io::Write::write_all(&mut file, expected) {
+        let written = std::io::Write::write_all(&mut file, expected).and_then(|()| {
+            if mode == super::identity::IdentityMode::Content {
+                verify_backup_copy(&file, expected)
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(error) = written {
             drop(file);
             let _ = unlinkat(backup_directory, backup_name, AtFlags::empty());
             return Err(error);
@@ -4206,8 +4241,20 @@ pub(crate) fn prepare_pool_meta_owned_backup(
         directory,
         source: old,
         linked,
+        mode,
         _ancestors: (source_guards, backup_guards),
     })
+}
+
+#[cfg(unix)]
+fn verify_backup_copy(file: &std::fs::File, expected: &[u8]) -> io::Result<()> {
+    use sha2::{Digest, Sha256};
+    let length = u64::try_from(expected.len()).map_err(|_| io::Error::other("pool metadata length overflow"))?;
+    let expected_sha256 = <[u8; 32]>::from(Sha256::digest(expected));
+    if file.metadata()?.len() != length || super::identity::sha256_at(file, length)? != expected_sha256 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "pool metadata backup copy changed"));
+    }
+    Ok(())
 }
 
 /// Faults are keyed by the final physical destination, including metadata
