@@ -240,6 +240,75 @@ def run(base):
 
     result("rename_over_pinned_head_with_open_backup", pool_meta_like)
 
+    def read(path):
+        with open(path, "rb") as handle:
+            return handle.read()
+
+    def commit_released(directory, keep_backup_open=False, hold_dir_fd=False, rollback=False):
+        # Candidate sequence: copy the predecessor, release its descriptor,
+        # re-check it by content, then rename the staged file over it.
+        head, backup, staged = (os.path.join(directory, name) for name in ("head", "backup", "staged"))
+        write(head, b"old")
+        dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY) if hold_dir_fd else None
+        copy = None
+        try:
+            pinned = os.open(head, os.O_RDONLY)
+            try:
+                old = os.pread(pinned, 16, 0)
+            finally:
+                os.close(pinned)
+            copy = os.open(backup, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o666)
+            os.write(copy, old)
+            copied = os.pread(copy, 16, 0)
+            os.fdatasync(copy)
+            if not keep_backup_open:
+                os.close(copy)
+                copy = None
+            staged_fd = os.open(staged, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o666)
+            try:
+                os.write(staged_fd, b"new")
+                os.fdatasync(staged_fd)
+            finally:
+                os.close(staged_fd)
+            unchanged = read(head) == old
+            if hold_dir_fd:
+                os.rename("staged", "head", src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+                os.fsync(dir_fd)
+            else:
+                os.rename(staged, head)
+            report = "copy_ok:%s head_unchanged_before:%s head_is_new:%s backup_is_old:%s" % (
+                copied == old, unchanged, read(head) == b"new", read(backup) == old)
+            if rollback:
+                if copy is not None:
+                    os.close(copy)
+                    copy = None
+                os.rename(backup, head)
+                report += " head_restored:%s" % (read(head) == old)
+            return report
+        finally:
+            if copy is not None:
+                os.close(copy)
+            if dir_fd is not None:
+                os.close(dir_fd)
+
+    result("commit_released_head", lambda: commit_released(fresh()))
+    result("commit_released_head_backup_open", lambda: commit_released(fresh(), keep_backup_open=True))
+    result("commit_released_head_dirfd_held", lambda: commit_released(fresh(), hold_dir_fd=True))
+    result("commit_released_head_then_rollback", lambda: commit_released(fresh(), rollback=True))
+
+    def repeated():
+        # Catches a close that the client defers: the rename follows the close
+        # without any pause, 20 times in a row.
+        failures = []
+        for _round in range(20):
+            try:
+                commit_released(fresh(), hold_dir_fd=True)
+            except OSError as error:
+                failures.append(errno.errorcode.get(error.errno, error.errno))
+        return "failures=%d/20 %s" % (len(failures), " ".join(map(str, failures)))
+
+    result("commit_released_head_x20", repeated)
+
 
 if __name__ == "__main__":
     main()
