@@ -23,6 +23,7 @@ pub mod error_reduce;
 pub mod format;
 pub mod fs;
 pub mod health_state;
+pub(crate) mod identity;
 mod io_admission;
 #[cfg(test)]
 pub(crate) mod lifecycle_test_io;
@@ -1567,6 +1568,8 @@ pub(crate) async fn new_disk_with_health_tracker(
     reconnect: Option<disk_store::ReconnectDiskHealthState>,
 ) -> Result<DiskStore> {
     if ep.is_local {
+        // Resolve the identity mode now so its startup notice is logged with the first local disk.
+        identity::identity_mode();
         let s = LocalDisk::new(ep, opt.cleanup).await?;
         Ok(Arc::new(Disk::Local(Box::new(LocalDiskWrapper::new_with_reconnect_state(
             Arc::new(s),

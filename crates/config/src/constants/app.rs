@@ -196,6 +196,16 @@ pub const RUSTFS_UNSUPPORTED_FS_POLICY_WARN: &str = "warn";
 pub const RUSTFS_UNSUPPORTED_FS_POLICY_FAIL: &str = "fail";
 pub const DEFAULT_RUSTFS_UNSUPPORTED_FS_POLICY: &str = RUSTFS_UNSUPPORTED_FS_POLICY_WARN;
 
+/// Environment variable selecting how local file identity is decided.
+///
+/// Accepted values:
+/// - "inode" (default): compare device and inode numbers
+/// - "content": for filesystems without stable inode numbers (CIFS/SMB)
+pub const ENV_RUSTFS_FS_IDENTITY_MODE: &str = "RUSTFS_FS_IDENTITY_MODE";
+pub const RUSTFS_FS_IDENTITY_MODE_INODE: &str = "inode";
+pub const RUSTFS_FS_IDENTITY_MODE_CONTENT: &str = "content";
+pub const DEFAULT_RUSTFS_FS_IDENTITY_MODE: &str = RUSTFS_FS_IDENTITY_MODE_INODE;
+
 /// Environment variable for server OBS endpoint.
 pub const ENV_RUSTFS_OBS_ENDPOINT: &str = "RUSTFS_OBS_ENDPOINT";
 

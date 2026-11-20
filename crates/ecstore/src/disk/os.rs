@@ -3929,14 +3929,6 @@ fn open_anchored_metadata(path: &Path, publication_root: &PublicationRoot) -> io
 }
 
 #[cfg(unix)]
-fn same_inode(first: &std::fs::File, second: &std::fs::File) -> io::Result<bool> {
-    use std::os::unix::fs::MetadataExt;
-    let first = first.metadata()?;
-    let second = second.metadata()?;
-    Ok(first.dev() == second.dev() && first.ino() == second.ino())
-}
-
-#[cfg(unix)]
 fn bounded_file_sha256(file: &mut std::fs::File, length: u64) -> io::Result<[u8; 32]> {
     use sha2::{Digest, Sha256};
     let metadata = file.metadata()?;
@@ -3983,13 +3975,13 @@ impl DurableFileReceipt {
                 .ok_or_else(|| io::Error::other("missing root directory guard"))?
                 .try_clone()?,
         );
-        same_inode(&self.root, &directory)
+        super::identity::durability_proof_transfers(&self.root, &directory, super::identity::identity_mode())
     }
 
     pub(crate) fn matches_source(&self, root: &PublicationRoot, source: &std::fs::File, expected: &[u8]) -> bool {
         use sha2::{Digest, Sha256};
         self.matches_root(root).unwrap_or(false)
-            && same_inode(&self.head, source).unwrap_or(false)
+            && super::identity::durability_proof_transfers(&self.head, source, super::identity::identity_mode()).unwrap_or(false)
             && self.raw_length == expected.len() as u64
             && self.sha256 == <[u8; 32]>::from(Sha256::digest(expected))
     }
@@ -3998,7 +3990,7 @@ impl DurableFileReceipt {
         (|| -> io::Result<bool> {
             let mut current = open_anchored_metadata(path, root)?;
             Ok(self.matches_root(root)?
-                && same_inode(&self.head, &current)?
+                && super::identity::durability_proof_transfers(&self.head, &current, super::identity::identity_mode())?
                 && bounded_file_sha256(&mut current, self.raw_length)? == self.sha256)
         })()
         .unwrap_or(false)
@@ -4044,7 +4036,8 @@ impl PreparedPoolMetaBackup {
     pub(crate) fn can_reuse_durability(&self, receipt: &DurableFileReceipt, root: &PublicationRoot, expected: &[u8]) -> bool {
         self.linked
             && receipt.matches_source(root, &self.source, expected)
-            && same_inode(&self.source, &self.file).unwrap_or(false)
+            && super::identity::durability_proof_transfers(&self.source, &self.file, super::identity::identity_mode())
+                .unwrap_or(false)
     }
 
     pub(crate) fn sync_directory(&self) -> io::Result<()> {
@@ -4056,7 +4049,6 @@ impl PreparedPoolMetaBackup {
 
     pub(crate) fn verify_paths(&self, base: &Path, publication_root: &PublicationRoot) -> io::Result<()> {
         use rustix::fs::{Mode, OFlags, openat};
-        use std::os::unix::fs::MetadataExt;
         for (path, expected) in [(&self.source_path, &self.source), (&self.path, &self.file)] {
             let parents = open_existing_directory_below_base_std(
                 path.parent().ok_or_else(|| io::Error::other("metadata has no parent"))?,
@@ -4073,9 +4065,7 @@ impl PreparedPoolMetaBackup {
                 OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
             )?);
-            let current = current.metadata()?;
-            let expected = expected.metadata()?;
-            if current.dev() != expected.dev() || current.ino() != expected.ino() {
+            if !super::identity::same_file_handle(&current, expected, super::identity::identity_mode())? {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "pool metadata backup publication changed"));
             }
         }
@@ -4155,6 +4145,8 @@ pub(crate) fn prepare_pool_meta_owned_backup(
     use rustix::fs::{AtFlags, Mode, OFlags, linkat, openat, unlinkat};
     use std::os::unix::fs::MetadataExt;
 
+    let mode = super::identity::identity_mode();
+    let force_copy = force_copy || super::identity::prefer_copy_over_hardlink(mode);
     let source_parent = source.parent().ok_or_else(|| io::Error::other("source has no parent"))?;
     let backup_parent = backup.parent().ok_or_else(|| io::Error::other("backup has no parent"))?;
     let source_guards = open_existing_directory_below_base_std(source_parent, base, publication_root)?;
@@ -4187,7 +4179,7 @@ pub(crate) fn prepare_pool_meta_owned_backup(
     let file = if linked {
         let file = std::fs::File::from(openat(backup_directory, backup_name, flags, Mode::empty())?);
         let actual = file.metadata()?;
-        if actual.dev() != identity.dev() || actual.ino() != identity.ino() {
+        if !super::identity::same_identity_fields(identity.dev(), identity.ino(), actual.dev(), actual.ino(), mode) {
             let _ = unlinkat(backup_directory, backup_name, AtFlags::empty());
             return Err(io::Error::new(io::ErrorKind::InvalidData, "pool metadata hardlink source changed"));
         }

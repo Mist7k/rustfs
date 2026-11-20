@@ -14092,7 +14092,7 @@ impl DiskAPI for LocalDisk {
         };
 
         if let Some(file_info) = &format_info.file_info
-            && super::fs::same_file(&file_meta, file_info)
+            && super::identity::same_file_metadata(&file_meta, file_info, super::identity::identity_mode())
         {
             let mut format_info = self.format_info.write().await;
             format_info.last_check = Some(OffsetDateTime::now_utc());

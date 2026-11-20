@@ -293,6 +293,11 @@ Drive timeout profile preset:
   - `warn` (default): log warning and continue startup.
   - `fail`: abort startup with an error.
 
+- `RUSTFS_FS_IDENTITY_MODE` selects how local file identity is decided.
+  - `inode` (default): compare device and inode numbers.
+  - `content`: for filesystems without stable inode numbers such as CIFS/SMB; logs a startup warning. Identity checks that cannot be proven by content fail closed.
+  - an invalid value logs an error and falls back to `inode`.
+
 RustFS production guidance remains direct-attached local POSIX filesystems. Network-mounted filesystems (for example `nfs`, `cifs`, `smb2`, and `fuse.*`) are treated as unsupported by this startup guard. On Windows, endpoints on network drives (UNC shares such as `\\server\share` and mapped drive letters) are treated the same way, even though Windows reports the server's filesystem (usually `NTFS`) for them.
 
 ## 📄 License
