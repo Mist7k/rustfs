@@ -19,10 +19,17 @@
 #
 # Usage: run-matrix-cell.sh <target> <fs> <rustfs-binary> [out-dir]
 #   fs: local | cifs-noserverino | cifs-serverino | cifs-noserverino-strict
+#       | external
+#   external: use the existing, empty directory in CELL_DATA_DIR as the rustfs
+#   data dir (e.g. a real CIFS mount). No sudo, docker or mount handling; the
+#   caller owns the data dir.
 #
 # Optional environment:
 #   RUSTFS_EXTRA_ENV   whitespace separated KEY=VALUE pairs passed to rustfs
-#   CELL_WORK_DIR      scratch directory (default /mnt/cifs-matrix)
+#   CELL_WORK_DIR      scratch directory (default /mnt/cifs-matrix,
+#                      /tmp/cifs-matrix for fs=external)
+#   CELL_DATA_DIR      data dir, required for fs=external
+#   CELL_PORT          rustfs listen port (default 9000)
 
 set -euo pipefail
 
@@ -36,10 +43,14 @@ FS="$2"
 BIN="$(readlink -f "$3")"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT_DIR="${4:-$PWD/cifs-matrix-out/${TARGET}__${FS}}"
-WORK="${CELL_WORK_DIR:-/mnt/cifs-matrix}"
+if [[ "$FS" == external ]]; then
+  WORK="${CELL_WORK_DIR:-/tmp/cifs-matrix}"
+else
+  WORK="${CELL_WORK_DIR:-/mnt/cifs-matrix}"
+fi
 EXTRA_ENV="${RUSTFS_EXTRA_ENV:-}"
 
-PORT=9000
+PORT="${CELL_PORT:-9000}"
 ENDPOINT="http://127.0.0.1:${PORT}"
 ACCESS_KEY="cifsmatrixadmin"
 SECRET_KEY="cifsmatrixsecret"
@@ -57,6 +68,7 @@ DATA=""
 
 RUSTFS_PID=""
 IS_CIFS=0
+IS_EXTERNAL=0
 CACHE_OPT=""
 SERVERINO_OPT=""
 
@@ -65,8 +77,20 @@ case "$FS" in
   cifs-noserverino)        IS_CIFS=1; CACHE_OPT="cache=none";   SERVERINO_OPT="noserverino" ;;
   cifs-serverino)          IS_CIFS=1; CACHE_OPT="cache=none";   SERVERINO_OPT="serverino" ;;
   cifs-noserverino-strict) IS_CIFS=1; CACHE_OPT="cache=strict"; SERVERINO_OPT="noserverino" ;;
+  external)                IS_EXTERNAL=1 ;;
   *) echo "unknown fs: $FS" >&2; exit 2 ;;
 esac
+
+if [[ "$IS_EXTERNAL" == 1 ]]; then
+  if [[ -z "${CELL_DATA_DIR:-}" || ! -d "$CELL_DATA_DIR" ]]; then
+    echo "fs=external requires CELL_DATA_DIR to be an existing directory" >&2
+    exit 2
+  fi
+  if [[ -n "$(ls -A "$CELL_DATA_DIR")" ]]; then
+    echo "CELL_DATA_DIR must be empty: $CELL_DATA_DIR" >&2
+    exit 2
+  fi
+fi
 
 [[ -x "$BIN" ]] || { echo "rustfs binary not executable: $BIN" >&2; exit 2; }
 
@@ -194,7 +218,47 @@ SMBCONF
   return 1
 }
 
+# fs=external: hide the mount source and credential/address values in mount
+# info; every other option stays visible.
+redact_mount() {
+  sed -E \
+    -e 's#(^|[ \t])(//|\\\\)[^ \t]*#\1REDACTED#g' \
+    -e 's/(^|[ \t,])(username|addr|ip|domain|password)=[^, \t]*/\1\2=REDACTED/g'
+}
+
+# fs=external: print the /proc/mounts line whose mount point is the longest
+# prefix of $1 (fallback when findmnt is missing).
+proc_mounts_for() {
+  awk -v p="$1" '
+    { m = $2; gsub(/\\040/, " ", m)
+      if (p == m || index(p, (m == "/" ? "/" : m "/")) == 1) {
+        if (length(m) > best) { best = length(m); line = $0 }
+      } }
+    END { if (line != "") print line }' /proc/mounts
+}
+
 prepare_fs() {
+  if [[ "$IS_EXTERNAL" == 1 ]]; then
+    mkdir -p "$WORK"
+    rm -rf "$TMP"
+    mkdir -p "$TMP"
+    DATA="$CELL_DATA_DIR"
+    {
+      echo "fs=$FS"
+      echo "data_dir=$DATA"
+      echo "--- mount (redacted)"
+      if command -v findmnt >/dev/null 2>&1; then
+        findmnt -T "$DATA" -o TARGET,SOURCE,FSTYPE,OPTIONS 2>&1 | redact_mount || true
+      else
+        proc_mounts_for "$(readlink -f "$DATA")" | redact_mount || true
+      fi
+      echo "--- uname -r"
+      uname -r
+    } > "$OUT_DIR/mounts.txt"
+    cat "$OUT_DIR/mounts.txt"
+    return 0
+  fi
+
   sudo mkdir -p "$WORK"
   sudo chown "$(id -u):$(id -g)" "$WORK"
   rm -rf "$EXPORT" "$MNT" "$TMP" "$WORK/local-data"
