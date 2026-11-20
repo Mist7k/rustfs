@@ -209,6 +209,24 @@ fn same_file_metadata_without_inode(a: &std::fs::Metadata, b: &std::fs::Metadata
     super::fs::same_file(a, b)
 }
 
+/// Whether `linked`, a hardlink just made from the path `original` was opened at, still names
+/// the file behind `original`. `before` is the source metadata captured before the link.
+#[cfg(unix)]
+pub(crate) fn hardlink_matches_source(
+    original: &std::fs::File,
+    before: &std::fs::Metadata,
+    linked: &std::fs::Metadata,
+    mode: IdentityMode,
+) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    match mode {
+        IdentityMode::Inode => Ok(linked.dev() == before.dev() && linked.ino() == before.ino()),
+        // Creating the link changes the change time, so the source is read again through its
+        // still-open descriptor. A substituted source differs from the link in length or times.
+        IdentityMode::Content => Ok(same_file_metadata_without_inode(&original.metadata()?, linked)),
+    }
+}
+
 /// Hardlink identity cannot be verified without stable inodes, so the verified
 /// copy path is used instead.
 #[cfg(unix)]
@@ -408,5 +426,28 @@ mod tests {
         assert!(!same_identity_fields(1, 2, 1, 2, IdentityMode::Content));
         assert!(prefer_copy_over_hardlink(IdentityMode::Content));
         assert!(!prefer_copy_over_hardlink(IdentityMode::Inode));
+    }
+
+    #[test]
+    fn hardlink_matches_source_accepts_the_link_and_rejects_a_substituted_source() {
+        for mode in [IdentityMode::Inode, IdentityMode::Content] {
+            let dir = tempfile::tempdir().expect("temporary directory");
+            let source = dir.path().join("source");
+            let link = dir.path().join("link");
+            fs::write(&source, b"shard").expect("write source");
+            let original = fs::File::open(&source).expect("open source");
+            let before = original.metadata().expect("source metadata");
+            fs::hard_link(&source, &link).expect("link source");
+            let linked = fs::metadata(&link).expect("link metadata");
+            assert!(hardlink_matches_source(&original, &before, &linked, mode).expect("unchanged source"));
+
+            let substitute = dir.path().join("substitute");
+            let late_link = dir.path().join("late-link");
+            fs::write(&substitute, b"another shard").expect("write substitute");
+            fs::rename(&substitute, &source).expect("substitute source");
+            fs::hard_link(&source, &late_link).expect("link substituted source");
+            let late = fs::metadata(&late_link).expect("late link metadata");
+            assert!(!hardlink_matches_source(&original, &before, &late, mode).expect("substituted source"));
+        }
     }
 }

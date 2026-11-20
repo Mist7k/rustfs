@@ -7867,7 +7867,7 @@ pub(crate) fn hardlink_multipart_source_files(
     #[cfg(unix)]
     {
         use rustix::fs::{AtFlags, Mode, OFlags, linkat, openat, unlinkat};
-        use std::os::unix::fs::MetadataExt;
+        let identity_mode = super::identity::identity_mode();
         #[cfg(test)]
         let source_path = source.to_path_buf();
         #[cfg(test)]
@@ -7895,7 +7895,7 @@ pub(crate) fn hardlink_multipart_source_files(
             linkat(source, name.as_str(), destination, name.as_str(), AtFlags::empty())?;
             let linked = std::fs::File::from(openat(destination, name.as_str(), flags, Mode::empty())?);
             let actual = linked.metadata()?;
-            if actual.dev() != expected.dev() || actual.ino() != expected.ino() {
+            if !super::identity::hardlink_matches_source(&original, &expected, &actual, identity_mode)? {
                 let _ = unlinkat(destination, name.as_str(), AtFlags::empty());
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "multipart shard changed during staging"));
             }

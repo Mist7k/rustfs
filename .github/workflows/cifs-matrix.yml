@@ -156,7 +156,7 @@ jobs:
         env:
           TARGET: branch-${{ matrix.identity }}
           FS: ${{ matrix.fs }}
-          RUSTFS_EXTRA_ENV: RUSTFS_FS_IDENTITY_MODE=${{ matrix.identity }}
+          RUSTFS_EXTRA_ENV: RUSTFS_FS_IDENTITY_MODE=${{ matrix.identity }} RUSTFS_ISSUE3031_DIAG_ENABLE=true
         run: |
           chmod +x "$RUNNER_TEMP/rustfs-bin/rustfs"
           bash scripts/cifs-matrix/run-matrix-cell.sh \

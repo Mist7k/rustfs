@@ -45,7 +45,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_ROOT="/tmp/rustfs-bin"
 DL_DIR="/tmp/rustfs-dl"
 OUT_ROOT="/tmp/cifs-out"
-SIG_RE='FileCorrupt|transaction_unknown|rename_indeterminate|erasure write quorum|Invalid argument|read_file_all|quorum unavailable'
+SIG_RE='FileCorrupt|transaction_unknown|rename_indeterminate|erasure write quorum|Invalid argument|read_file_all|quorum unavailable|issue3031_rename_data_quorum_failed'
 
 # The probe never needs this; make sure nothing writes to it.
 unset GITHUB_STEP_SUMMARY
