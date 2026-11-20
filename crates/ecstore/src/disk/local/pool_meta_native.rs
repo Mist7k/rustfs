@@ -1453,7 +1453,7 @@ mod tests {
         let open_on_source = |source: &std::path::Path| {
             std::fs::read_dir("/proc/self/fd")
                 .expect("descriptor table")
-                .filter_map(Result::ok)
+                .filter_map(|entry| entry.ok())
                 .filter(|entry| std::fs::read_link(entry.path()).is_ok_and(|target| target == source))
                 .count()
         };
@@ -1462,7 +1462,10 @@ mod tests {
         let open_on_source = |_: &std::path::Path| open_on_source(&canonical);
         let pinned = os::prepare_pool_meta_owned_backup_with_mode(
             &source,
-            &base.join(OBJECT).join(Uuid::new_v4().to_string()).join(STORAGE_FORMAT_FILE_BACKUP),
+            &base
+                .join(OBJECT)
+                .join(Uuid::new_v4().to_string())
+                .join(STORAGE_FORMAT_FILE_BACKUP),
             &base,
             &root,
             b"predecessor",
