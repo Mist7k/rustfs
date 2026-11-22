@@ -33,6 +33,12 @@ Environment:
   BUCKET_MAX_SECONDS per bucket copy limit (default 1500)
   SYS_MAX_BYTES      limit for .rustfs.sys (default 12 GiB)
   MIN_FREE_BYTES     abort when less would stay free (default 300 GiB)
+  EMPTY_BUCKETS      bucket names created as empty dirs (settings come from the
+                     copied system dir, objects are left out)
+  CRED_FILES         space separated <label>=<file>:<access var>:<secret var>;
+                     the values are read from env or compose files and never
+                     printed. Label "root" becomes the server credentials, every
+                     other pair is probed against each bucket under both binaries
 """
 
 import atexit
@@ -62,6 +68,8 @@ GIB = 1 << 30
 SRC = os.environ["SRC"]
 SB_ROOT = os.environ["SB_ROOT"]
 BUCKETS = os.environ.get("BUCKETS", "").split()
+EMPTY_BUCKETS = os.environ.get("EMPTY_BUCKETS", "").split()
+CRED_FILES = os.environ.get("CRED_FILES", "").split()
 BUCKET_MAX_BYTES = int(os.environ.get("BUCKET_MAX_BYTES", 5 * GIB))
 BUCKET_MAX_SECONDS = int(os.environ.get("BUCKET_MAX_SECONDS", 1500))
 SYS_MAX_BYTES = int(os.environ.get("SYS_MAX_BYTES", 12 * GIB))
@@ -78,6 +86,66 @@ T = os.path.join(SB_ROOT, ".cifscompat-" + time.strftime("%Y%m%dT%H%M%SZ", time.
 DATA = os.path.join(T, "data")
 proc = None
 results = []
+
+
+SECRETS = set()
+
+
+def scrub(text):
+    for v in sorted(SECRETS, key=len, reverse=True):
+        text = text.replace(v, "<redacted>")
+    return text
+
+
+class Redact:
+    """Stdout wrapper: no credential value may reach the container log."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def write(self, text):
+        return self.inner.write(scrub(text))
+
+    def flush(self):
+        self.inner.flush()
+
+
+sys.stdout = Redact(sys.stdout)
+sys.stderr = Redact(sys.stderr)
+
+
+def read_var(path, name):
+    """Value of NAME from an env file or a compose file, '' when absent."""
+    pat = re.compile(r"^\s*-?\s*" + re.escape(name) + r"\s*[=:]\s*(.*?)\s*$")
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            m = pat.match(line)
+            if m:
+                v = m.group(1).strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+                    v = v[1:-1]
+                return v
+    return ""
+
+
+def load_creds():
+    """Returns {label: (access, secret)}; unusable entries are reported by label."""
+    creds = {}
+    for item in CRED_FILES:
+        label, spec = item.split("=", 1)
+        path, avar, svar = spec.split(":")
+        try:
+            ak, sk = read_var(path, avar), read_var(path, svar)
+        except OSError as e:
+            say(f"credentials {label}: file not readable ({type(e).__name__})")
+            continue
+        if not ak or not sk or "${" in ak + sk:
+            say(f"credentials {label}: not found as literal values")
+            continue
+        SECRETS.update((ak, sk))
+        creds[label] = (ak, sk)
+        say(f"credentials {label}: loaded")
+    return creds
 
 
 def say(msg):
@@ -235,6 +303,9 @@ def step_copy():
         except (Budget, OSError) as e:
             say(f"bucket {bucket} left out: {e}")
             shutil.rmtree(dst, ignore_errors=True)
+    for bucket in EMPTY_BUCKETS:
+        if os.path.isdir(os.path.join(SRC, bucket)):
+            os.makedirs(os.path.join(DATA, bucket), exist_ok=True)
     rec("1 copy", "PASS" if copied else "FAIL", f"buckets: {' '.join(copied)}; free now {free_bytes() / GIB:.1f} GiB")
     return bool(copied)
 
@@ -304,7 +375,7 @@ def log_report(label):
         lines = f.read().decode("utf-8", "replace").splitlines()
     errs = collections.Counter()
     for line in lines:
-        line = ANSI.sub("", line)
+        line = scrub(ANSI.sub("", line))
         if "ERROR" in line or "panic" in line:
             errs[NOISE.sub("#", line)[:260]] += 1
     say(f"log {label}: {len(lines)} lines, {sum(errs.values())} error lines, {len(errs)} distinct")
@@ -316,17 +387,17 @@ def log_tail(n=25):
     with open(LOG, "rb") as f:
         f.seek(max(0, os.path.getsize(LOG) - 12000))
         for line in f.read().decode("utf-8", "replace").splitlines()[-n:]:
-            say("  | " + ANSI.sub("", line)[:300])
+            say("  | " + scrub(ANSI.sub("", line))[:300])
 
 
 # -------------------------------------------------------------------- s3 ----
-def client():
+def client(access=None, secret=None):
     return boto3.client(
         "s3",
         endpoint_url=ENDPOINT,
         region_name="us-east-1",
-        aws_access_key_id=ACCESS_KEY,
-        aws_secret_access_key=SECRET_KEY,
+        aws_access_key_id=access or ACCESS_KEY,
+        aws_secret_access_key=secret or SECRET_KEY,
         config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 2}, read_timeout=120, max_pool_connections=8),
     )
 
@@ -366,6 +437,56 @@ def fs_keys(bucket):
             continue
         stack.extend(e.path for e in entries if e.is_dir(follow_symlinks=False))
     return keys
+
+
+def call(fn, **kw):
+    try:
+        fn(**kw)
+        return "ok"
+    except (ClientError, BotoCoreError) as e:
+        return err_code(e)
+
+
+def auth_probe(root, creds, buckets):
+    """What every non-root key may do per bucket: list, put, get, delete."""
+    out = {}
+    for label, (ak, sk) in sorted(creds.items()):
+        if label == "root":
+            continue
+        c = client(ak, sk)
+        key = f"{MARK}-auth/{label}"
+        try:
+            sig = {"list_buckets": sorted(b["Name"] for b in c.list_buckets().get("Buckets", []))}
+        except (ClientError, BotoCoreError) as e:
+            sig = {"list_buckets": err_code(e)}
+        for b in buckets:
+            sig[b] = [
+                call(c.list_objects_v2, Bucket=b, MaxKeys=5),
+                call(c.put_object, Bucket=b, Key=key, Body=b"x" * 1024),
+                call(c.get_object, Bucket=b, Key=key),
+                call(c.delete_object, Bucket=b, Key=key),
+            ]
+            call(root.delete_object, Bucket=b, Key=key)
+        out[label] = sig
+    return out
+
+
+def auth_show(sig):
+    for label, v in sig.items():
+        say(f"  key {label}: list_buckets {v['list_buckets']}")
+        groups = collections.defaultdict(list)
+        for b, r in v.items():
+            if b != "list_buckets":
+                groups[" ".join(f"{n}={x}" for n, x in zip(("list", "put", "get", "delete"), r))].append(b)
+        for r, bs in groups.items():
+            say(f"    {r}: {' '.join(bs)}")
+
+
+def auth_check(step, want, got):
+    if not want:
+        return
+    auth_show(got)
+    rec(step, "PASS" if want == got else "FAIL", "same rights as under the old binary" if want == got else "rights differ")
 
 
 def manifest(s3):
@@ -499,7 +620,11 @@ WROTE = set()
 
 def main():
     signal.signal(signal.SIGTERM, on_term)
+    global ACCESS_KEY, SECRET_KEY
     atexit.register(cleanup)
+    creds = load_creds()
+    if "root" in creds:
+        ACCESS_KEY, SECRET_KEY = creds["root"]
     old_bin = fetch(os.environ["OLD_URL"], "/tmp/rustfs-old")
     new_bin = fetch(os.environ["NEW_URL"], "/tmp/rustfs-new")
     if not step_copy():
@@ -521,6 +646,10 @@ def main():
     if not any(v["objects"] for v in base.values()):
         rec("3 old binary reads the copy", "FAIL", "no objects, nothing to compare")
         return
+    auth = auth_probe(s3, creds, sorted(base))
+    if auth:
+        auth_show(auth)
+        rec("3b application keys under the old binary", "INFO", f"{len(auth)} keys probed")
 
     note = start_rustfs(new_bin, NEW_ENV, "new")
     if note:
@@ -531,6 +660,7 @@ def main():
     got = manifest(s3)
     log_report("new binary")
     check("5 new binary reads the same", base, got)
+    auth_check("5b application keys under the new binary", auth, auth_probe(s3, creds, sorted(base)))
 
     exp = copy.deepcopy(got)
     try:
@@ -562,6 +692,7 @@ def main():
     got = manifest(s3)
     log_report("old binary again")
     check("9 old binary reads everything", exp, got)
+    auth_check("9b application keys under the old binary again", auth, auth_probe(s3, creds, sorted(base)))
 
 
 if __name__ == "__main__":
