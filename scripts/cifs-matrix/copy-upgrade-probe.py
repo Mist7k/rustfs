@@ -306,6 +306,16 @@ def step_copy():
     for bucket in EMPTY_BUCKETS:
         if os.path.isdir(os.path.join(SRC, bucket)):
             os.makedirs(os.path.join(DATA, bucket), exist_ok=True)
+    if os.environ.get("SYS_LISTING"):
+        # Largest entries of the system bucket dir, for diagnosing oversized state.
+        sizes = []
+        root = os.path.join(DATA, ".rustfs.sys", "buckets")
+        for d, _, names in os.walk(root):
+            for n in names:
+                sizes.append((os.path.getsize(os.path.join(d, n)), os.path.relpath(os.path.join(d, n), root)))
+        say(f"system bucket dir: {len(sizes)} files")
+        for size, name in sorted(sizes, reverse=True)[:25]:
+            say(f"  {size / (1 << 20):9.1f} MiB  {name}")
     rec("1 copy", "PASS" if copied else "FAIL", f"buckets: {' '.join(copied)}; free now {free_bytes() / GIB:.1f} GiB")
     return bool(copied)
 
@@ -377,7 +387,7 @@ def log_report(label):
     for line in lines:
         line = scrub(ANSI.sub("", line))
         if "ERROR" in line or "panic" in line:
-            errs[NOISE.sub("#", line)[:260]] += 1
+            errs[NOISE.sub("#", line)[: int(os.environ.get("LOG_WIDTH", "260"))]] += 1
     say(f"log {label}: {len(lines)} lines, {sum(errs.values())} error lines, {len(errs)} distinct")
     for msg, n in errs.most_common(6):
         say(f"  {n}x {msg}")
