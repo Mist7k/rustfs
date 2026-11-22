@@ -15,7 +15,7 @@
 # Packages the branch binary into a container image and pushes it to the
 # package registry of this fork only. The binary comes from the newest
 # "CIFS Matrix" run of this branch that still has its build artifact; the image
-# tag carries the commit that binary was built from.
+# tag carries the commit that binary was built from. Runs only in the fork.
 
 name: CIFS Image
 
