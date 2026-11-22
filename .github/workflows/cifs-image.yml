@@ -53,7 +53,7 @@ jobs:
         run: |
           set -euo pipefail
           ctx="$RUNNER_TEMP/image-context"
-          mkdir -p "$ctx/scripts" "$RUNNER_TEMP/rustfs-bin"
+          mkdir -p "$ctx" "$RUNNER_TEMP/rustfs-bin"
           found=""
           while read -r id sha; do
             if gh run download "$id" --repo "$GITHUB_REPOSITORY" \
@@ -78,7 +78,6 @@ jobs:
           cp "$RUNNER_TEMP/rustfs-bin/rustfs" "$ctx/rustfs"
           chmod +x "$ctx/rustfs"
           cp -r Dockerfile.cifs-compat entrypoint.sh bootstrap "$ctx/"
-          cp scripts/download_rc.sh "$ctx/scripts/"
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
           {
             echo "ctx=$ctx"

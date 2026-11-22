@@ -15,21 +15,8 @@
 # Runtime image for a rustfs binary built in CI from the cifs-compat branch.
 # Same layout as Dockerfile.glibc, but the binary comes from the build context
 # (./rustfs) instead of an upstream release. The base matches the CI builder.
-
-FROM ubuntu:24.04 AS build
-
-ARG TARGETARCH
-ARG RC_RELEASE=latest
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    curl \
-    jq \
-    unzip \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY scripts/download_rc.sh /usr/local/bin/download_rc.sh
-RUN sh /usr/local/bin/download_rc.sh "$TARGETARCH" gnu "$RC_RELEASE" /build/rc
+# The rc client is left out: the entrypoint needs it only for bucket bootstrap,
+# and bootstrap/buckets.json is empty.
 
 FROM ubuntu:24.04
 
@@ -52,11 +39,10 @@ RUN apt-get update && apt-get upgrade -y \
     && rm -rf /var/lib/apt/lists/*
 
 COPY rustfs /usr/bin/rustfs
-COPY --from=build /build/rc /usr/bin/rc
 COPY entrypoint.sh /etc/rustfs/entrypoint.sh
 COPY bootstrap/ /etc/rustfs/bootstrap/
 
-RUN chmod +x /usr/bin/rustfs /usr/bin/rc /etc/rustfs/entrypoint.sh && \
+RUN chmod +x /usr/bin/rustfs /etc/rustfs/entrypoint.sh && \
     ln -s /etc/rustfs/entrypoint.sh /entrypoint.sh
 
 RUN groupadd -g 10001 rustfs && \
