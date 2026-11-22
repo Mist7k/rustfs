@@ -1,0 +1,87 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Runtime image for a rustfs binary built in CI from the cifs-compat branch.
+# Same layout as Dockerfile.glibc, but the binary comes from the build context
+# (./rustfs) instead of an upstream release. The base matches the CI builder.
+
+FROM ubuntu:24.04 AS build
+
+ARG TARGETARCH
+ARG RC_RELEASE=latest
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    jq \
+    unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY scripts/download_rc.sh /usr/local/bin/download_rc.sh
+RUN sh /usr/local/bin/download_rc.sh "$TARGETARCH" gnu "$RC_RELEASE" /build/rc
+
+FROM ubuntu:24.04
+
+ARG BUILD_DATE
+ARG VCS_REF
+
+LABEL name="RustFS (cifs-compat)" \
+      build-date="${BUILD_DATE}" \
+      vcs-ref="${VCS_REF}" \
+      summary="RustFS built from the cifs-compat branch (glibc)" \
+      license="Apache-2.0"
+
+RUN apt-get update && apt-get upgrade -y \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    jq \
+    tzdata \
+    && test "$(TZ=Asia/Kolkata date +%z)" = "+0530" \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY rustfs /usr/bin/rustfs
+COPY --from=build /build/rc /usr/bin/rc
+COPY entrypoint.sh /etc/rustfs/entrypoint.sh
+COPY bootstrap/ /etc/rustfs/bootstrap/
+
+RUN chmod +x /usr/bin/rustfs /usr/bin/rc /etc/rustfs/entrypoint.sh && \
+    ln -s /etc/rustfs/entrypoint.sh /entrypoint.sh
+
+RUN groupadd -g 10001 rustfs && \
+    useradd -u 10001 -g rustfs -m -s /sbin/nologin rustfs && \
+    mkdir -p /data/.rustfs/events /data/.rustfs/audit /logs /opt/rustfs && \
+    ln -s /data/.rustfs/events /opt/rustfs/events && \
+    ln -s /data/.rustfs/audit /opt/rustfs/audit && \
+    chown -R rustfs:rustfs /data /logs && \
+    chmod 0750 /data /logs
+
+ENV RUSTFS_ADDRESS=":9000" \
+    RUSTFS_CONSOLE_ADDRESS=":9001" \
+    RUSTFS_CONSOLE_ENABLE="true" \
+    RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS="*" \
+    RUSTFS_VOLUMES="/data" \
+    RUSTFS_OBS_LOGGER_LEVEL=warn \
+    RUSTFS_OBS_LOG_DIRECTORY=/logs \
+    RUSTFS_OBS_ENVIRONMENT=production
+
+EXPOSE 9000 9001
+
+VOLUME ["/data"]
+
+USER rustfs
+
+ENTRYPOINT ["/etc/rustfs/entrypoint.sh"]
+
+CMD ["rustfs"]

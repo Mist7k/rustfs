@@ -1,0 +1,138 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Packages the branch binary into a container image and pushes it to the
+# package registry of this fork only. The binary comes from the newest
+# "CIFS Matrix" run of this branch that still has its build artifact; the image
+# tag carries the commit that binary was built from.
+
+name: CIFS Image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ cifs-compat ]
+    paths:
+      - .github/workflows/cifs-image.yml
+      - Dockerfile.cifs-compat
+
+permissions:
+  contents: read
+  actions: read
+  packages: write
+
+concurrency:
+  group: cifs-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    name: Build and push image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # Never push from another repository, e.g. when upstream syncs this file.
+    if: github.repository == 'Mist7k/rustfs'
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+
+      - name: Assemble build context with the branch binary
+        id: ctx
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ctx="$RUNNER_TEMP/image-context"
+          mkdir -p "$ctx/scripts" "$RUNNER_TEMP/rustfs-bin"
+          found=""
+          while read -r id sha; do
+            if gh run download "$id" --repo "$GITHUB_REPOSITORY" \
+                --name rustfs-branch-binary --dir "$RUNNER_TEMP/rustfs-bin" 2>/dev/null; then
+              found="$id $sha"
+              break
+            fi
+          done < <(gh run list --repo "$GITHUB_REPOSITORY" --workflow cifs-matrix.yml \
+            --branch cifs-compat --limit 20 --json databaseId,headSha \
+            --jq '.[] | "\(.databaseId) \(.headSha)"')
+          test -n "$found"
+          bin_sha="${found#* }"
+          # The image must not claim a commit whose Rust sources differ from
+          # the ones the binary was built from.
+          if ! git fetch --quiet --depth 200 origin cifs-compat; then
+            echo "fetch failed" >&2; exit 1
+          fi
+          if ! git diff --quiet "$bin_sha" HEAD -- crates rustfs Cargo.toml Cargo.lock; then
+            echo "binary from $bin_sha is older than the Rust sources of HEAD" >&2
+            exit 1
+          fi
+          cp "$RUNNER_TEMP/rustfs-bin/rustfs" "$ctx/rustfs"
+          chmod +x "$ctx/rustfs"
+          cp -r Dockerfile.cifs-compat entrypoint.sh bootstrap "$ctx/"
+          cp scripts/download_rc.sh "$ctx/scripts/"
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          {
+            echo "ctx=$ctx"
+            echo "bin_sha=$bin_sha"
+            echo "image=$image"
+            echo "tag=cifs-compat-${bin_sha:0:9}"
+          } >> "$GITHUB_OUTPUT"
+          echo "binary from run/commit: $found" | tee -a "$GITHUB_STEP_SUMMARY"
+          sha256sum "$ctx/rustfs" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Build image
+        env:
+          CTX: ${{ steps.ctx.outputs.ctx }}
+          IMAGE: ${{ steps.ctx.outputs.image }}
+          TAG: ${{ steps.ctx.outputs.tag }}
+          BIN_SHA: ${{ steps.ctx.outputs.bin_sha }}
+        run: |
+          set -euo pipefail
+          docker build \
+            --file "$CTX/Dockerfile.cifs-compat" \
+            --build-arg BUILD_DATE="$(date -u +%FT%TZ)" \
+            --build-arg VCS_REF="$BIN_SHA" \
+            --tag "$IMAGE:$TAG" \
+            "$CTX"
+
+      - name: Smoke test image
+        env:
+          IMAGE: ${{ steps.ctx.outputs.image }}
+          TAG: ${{ steps.ctx.outputs.tag }}
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint /usr/bin/rustfs "$IMAGE:$TAG" --version
+          docker run -d --name smoke -p 127.0.0.1:9000:9000 \
+            -e RUSTFS_ACCESS_KEY=smoketestkey -e RUSTFS_SECRET_KEY=smoketestsecret \
+            -e RUSTFS_FS_IDENTITY_MODE=content \
+            "$IMAGE:$TAG"
+          ok=""
+          for _ in $(seq 60); do
+            code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:9000/health/ready || true)"
+            if [[ "$code" == 200 ]]; then ok=1; break; fi
+            sleep 1
+          done
+          docker logs smoke 2>&1 | tail -n 30
+          docker rm -f smoke >/dev/null
+          test -n "$ok"
+
+      - name: Push image
+        env:
+          IMAGE: ${{ steps.ctx.outputs.image }}
+          TAG: ${{ steps.ctx.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE:$TAG"
+          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$TAG")"
+          echo "pushed: $digest" | tee -a "$GITHUB_STEP_SUMMARY"
