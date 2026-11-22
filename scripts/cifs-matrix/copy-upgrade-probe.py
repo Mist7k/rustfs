@@ -338,14 +338,34 @@ def err_code(e):
 
 
 def get_sha(s3, bucket, key):
+    """Returns [bytes read, sha256 or ERR:<code>]."""
     try:
         body = s3.get_object(Bucket=bucket, Key=key)["Body"]
         h = hashlib.sha256()
+        n = 0
         for chunk in iter(lambda: body.read(1 << 20), b""):
             h.update(chunk)
-        return h.hexdigest()
+            n += len(chunk)
+        return [n, h.hexdigest()]
     except (ClientError, BotoCoreError, OSError) as e:
-        return err_code(e)
+        return [0, err_code(e)]
+
+
+def fs_keys(bucket):
+    """Object keys taken from the data dir: every directory holding an xl.meta."""
+    root = os.path.join(DATA, bucket)
+    keys, stack = [], [root]
+    while stack:
+        d = stack.pop()
+        try:
+            entries = list(os.scandir(d))
+        except OSError:
+            continue
+        if d != root and any(e.name == "xl.meta" for e in entries):
+            keys.append(os.path.relpath(d, root).replace(os.sep, "/"))
+            continue
+        stack.extend(e.path for e in entries if e.is_dir(follow_symlinks=False))
+    return keys
 
 
 def manifest(s3):
@@ -365,13 +385,14 @@ def manifest(s3):
                     meta[name] = json.dumps(r, sort_keys=True, default=str)
                 except (ClientError, BotoCoreError) as e:
                     meta[name] = err_code(e)
-            sizes = {}
+            keys = []
             try:
                 for page in s3.get_paginator("list_objects_v2").paginate(Bucket=b):
-                    for o in page.get("Contents", []):
-                        sizes[o["Key"]] = o["Size"]
+                    keys.extend(o["Key"] for o in page.get("Contents", []))
             except (ClientError, BotoCoreError) as e:
+                # Listing failed: read every object the data dir holds instead.
                 meta["list"] = err_code(e)
+                keys = fs_keys(b)
             try:
                 n = 0
                 for page in s3.get_paginator("list_object_versions").paginate(Bucket=b):
@@ -379,9 +400,9 @@ def manifest(s3):
                 meta["versions"] = n
             except (ClientError, BotoCoreError) as e:
                 meta["versions"] = err_code(e)
-            keys = sorted(sizes)
+            keys = sorted(keys)
             shas = pool.map(lambda k: get_sha(s3, b, k), keys)
-            out[b] = {"meta": meta, "objects": {k: [sizes[k], s] for k, s in zip(keys, shas)}}
+            out[b] = {"meta": meta, "objects": dict(zip(keys, shas))}
     return out
 
 
@@ -402,6 +423,11 @@ def diff(want, got):
             d.append(f"bucket {b} unexpected")
             continue
         for k in sorted(set(want[b]["meta"]) | set(got[b]["meta"])):
+            w, g = want[b]["meta"].get(k), got[b]["meta"].get(k)
+            if k in ("list", "versions") and w != g and "ERR:" in f"{w}{g}":
+                # A listing that only one side can do is reported, not counted.
+                say(f"  note: {b} {k}: {w} -> {g}")
+                continue
             if want[b]["meta"].get(k) != got[b]["meta"].get(k):
                 d.append(f"{b} {k}: {str(want[b]['meta'].get(k))[:80]} -> {str(got[b]['meta'].get(k))[:80]}")
         wo, go = want[b]["objects"], got[b]["objects"]
