@@ -39,6 +39,9 @@ Environment:
                      the values are read from env or compose files and never
                      printed. Label "root" becomes the server credentials, every
                      other pair is probed against each bucket under both binaries
+  DATA_NAME          name of the data dir inside the test dir (default "data")
+  HOLD_SECONDS       only copy, keep the copy this long for another container
+                     that mounts the test dir, then clean up; no binaries run
   SCANNER_RESET      set to 1: ask the new binary for a scanner usage-state
                      full rebuild and report whether the scanner errors stop
 """
@@ -85,7 +88,7 @@ LOG = "/tmp/rustfs.log"
 MARK = "zz-cifscompat"
 
 T = os.path.join(SB_ROOT, ".cifscompat-" + time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()))
-DATA = os.path.join(T, "data")
+DATA = os.path.join(T, os.environ.get("DATA_NAME", "data"))
 proc = None
 results = []
 
@@ -679,6 +682,14 @@ def main():
     creds = load_creds()
     if "root" in creds:
         ACCESS_KEY, SECRET_KEY = creds["root"]
+    hold = int(os.environ.get("HOLD_SECONDS", "0"))
+    if hold:
+        # Only provide the copy for another container, then remove it again.
+        if step_copy():
+            say(f"COPY_READY {os.path.basename(T)} for {hold}s")
+            time.sleep(hold)
+            say("hold over")
+        return
     old_bin = fetch(os.environ["OLD_URL"], "/tmp/rustfs-old")
     new_bin = fetch(os.environ["NEW_URL"], "/tmp/rustfs-new")
     if not step_copy():
