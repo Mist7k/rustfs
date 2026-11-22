@@ -39,6 +39,8 @@ Environment:
                      the values are read from env or compose files and never
                      printed. Label "root" becomes the server credentials, every
                      other pair is probed against each bucket under both binaries
+  SCANNER_RESET      set to 1: ask the new binary for a scanner usage-state
+                     full rebuild and report whether the scanner errors stop
 """
 
 import atexit
@@ -393,6 +395,48 @@ def log_report(label):
         say(f"  {n}x {msg}")
 
 
+def scanner_reset():
+    """POST the admin usage-state reset, then count scanner errors that follow."""
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    body = b'{"mode":"full-rebuild"}'
+    req = AWSRequest(
+        method="POST",
+        url=ENDPOINT + "/rustfs/admin/v3/scanner/usage-state/reset",
+        data=body,
+        headers={"Content-Type": "application/json", "x-amz-content-sha256": hashlib.sha256(body).hexdigest()},
+    )
+    SigV4Auth(Credentials(ACCESS_KEY, SECRET_KEY), "s3", "us-east-1").add_auth(req)
+    start = os.path.getsize(LOG)
+    try:
+        with urllib.request.urlopen(
+            urllib.request.Request(req.url, data=body, headers=dict(req.headers), method="POST"), timeout=600
+        ) as r:
+            status, text = r.status, r.read(2000).decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        status, text = e.code, e.read(2000).decode("utf-8", "replace")
+    except OSError as e:
+        rec("5c scanner usage reset", "FAIL", f"request failed: {type(e).__name__}")
+        return
+    say(f"  reset answer: http {status} {text[:600]}")
+    time.sleep(int(os.environ.get("SCANNER_WAIT", "150")))
+    with open(LOG, "rb") as f:
+        f.seek(start)
+        lines = [ANSI.sub("", x) for x in f.read().decode("utf-8", "replace").splitlines()]
+    failed = [x for x in lines if "usage_floor_load_failed" in x]
+    scanner = collections.Counter()
+    for x in lines:
+        if "scanner" in x.lower():
+            m = re.search(r'"message":"([^"]{0,90})', x)
+            scanner[(m.group(1) if m else x[:90])] += 1
+    for msg, n in scanner.most_common(12):
+        say(f"  scanner log {n}x {scrub(msg)}")
+    ok = status == 200 and not failed
+    rec("5c scanner usage reset", "PASS" if ok else "FAIL", f"http {status}, {len(failed)} usage floor errors afterwards")
+
+
 def log_tail(n=25):
     with open(LOG, "rb") as f:
         f.seek(max(0, os.path.getsize(LOG) - 12000))
@@ -671,6 +715,8 @@ def main():
     log_report("new binary")
     check("5 new binary reads the same", base, got)
     auth_check("5b application keys under the new binary", auth, auth_probe(s3, creds, sorted(base)))
+    if os.environ.get("SCANNER_RESET"):
+        scanner_reset()
 
     exp = copy.deepcopy(got)
     try:
